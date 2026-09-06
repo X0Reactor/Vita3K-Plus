@@ -15,11 +15,12 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+#include <algorithm>
 #include <vector>
 
 #include <gxm/functions.h>
-#include <gxm/types.h>
 #include <mem/functions.h>
+#include <gxm/types.h>
 #include <renderer/commands.h>
 #include <renderer/driver_functions.h>
 #include <renderer/functions.h>
@@ -389,13 +390,15 @@ COMMAND(handle_transfer_downscale) {
         delete dst;
     };
 
+    const uint64_t downscale_read_size = transfer_region_bytes(*src, pixel_bytes);
+
     const auto log_src = *src;
     const auto log_dst = *dst;
 
     bool gpu_path = false;
     if (renderer.current_backend == Backend::Vulkan && renderer.features.enable_memory_mapping && !renderer.disable_surface_sync) {
         // src->address has already been adjusted to the first read byte above
-        gpu_path = dynamic_cast<vulkan::VKState &>(renderer).surface_cache.check_for_surface(mem, src->address.address(), downscale_operation, dst->address.address());
+        gpu_path = dynamic_cast<vulkan::VKState &>(renderer).surface_cache.check_for_surface(mem, src->address.address(), downscale_operation, dst->address.address(), static_cast<uint32_t>(std::min<uint64_t>(downscale_read_size, UINT32_MAX)));
     }
 
     static std::atomic<uint32_t> downscales{ 0 };
