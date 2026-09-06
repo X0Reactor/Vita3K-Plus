@@ -299,6 +299,7 @@ struct SceGxmNotification {
 struct SceGxmRegisteredProgram {
     // TODO This is an opaque type.
     Ptr<const SceGxmProgram> program;
+    Address self = 0;
 };
 
 typedef Ptr<SceGxmRegisteredProgram> SceGxmShaderPatcherId;
