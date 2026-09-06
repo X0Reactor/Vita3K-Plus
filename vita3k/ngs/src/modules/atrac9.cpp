@@ -58,7 +58,7 @@ void Atrac9Module::on_state_change(const MemState &mem, ModuleData &data, const 
             static std::atomic<uint64_t> keyons{ 0 };
             const uint64_t n = keyons.fetch_add(1, std::memory_order_relaxed) + 1;
             if ((n % 128) == 0)
-                LOG_WARN("[NGSLIFE] AT9 key-ons so far: {}", n);
+                LOG_DEBUG("[NGSLIFE] AT9 key-ons so far: {}", n);
         }
         std::memset(&logical->saved_state, 0, sizeof(logical->saved_state));
     } else if (data.parent->is_keyed_off) {
@@ -132,7 +132,7 @@ bool Atrac9Module::decode_more_data(KernelState &kern, const MemState &mem, cons
             }
         } else {
             if (!logical->superframe_staging.empty()) {
-                LOG_ERROR("[AT9DIAG] voice={} loop wrap with {} staged bytes - dropping the partial superframe and resetting the decoder", fmt::ptr(data.parent), logical->superframe_staging.size());
+                LOG_DEBUG("[AT9DIAG] voice={} loop wrap with {} staged bytes - dropping the partial superframe and resetting the decoder", fmt::ptr(data.parent), logical->superframe_staging.size());
                 logical->superframe_staging.clear();
                 std::memset(&logical->saved_state, 0, sizeof(logical->saved_state));
                 runtime->decoder = std::make_unique<Atrac9DecoderState>(params->config_data);
@@ -292,14 +292,14 @@ bool Atrac9Module::decode_more_data(KernelState &kern, const MemState &mem, cons
         }
         constexpr bool AT9_DIAG_VERBOSE = false;
         if (AT9_DIAG_VERBOSE && logical->diag_superframes <= 3)
-            LOG_ERROR("[AT9DIAG] voice={} superframe #{} peak={:.4f} staged={} err={} in_head=0x{:016X} cfg=0x{:08X} ch={} buf={} pos={} discard_s={} discard_e={}",
+            LOG_DEBUG("[AT9DIAG] voice={} superframe #{} peak={:.4f} staged={} err={} in_head=0x{:016X} cfg=0x{:08X} ch={} buf={} pos={} discard_s={} discard_e={}",
                 fmt::ptr(data.parent), logical->diag_superframes, sf_peak, diag_staged ? 1 : 0, got_decode_error ? 1 : 0,
                 diag_in_head, static_cast<uint32_t>(params->config_data), static_cast<int>(params->channels),
                 state->current_buffer, state->current_byte_position_in_buffer,
                 bufparam.samples_discard_start_off, bufparam.samples_discard_end_off);
         if (logical->diag_silent_streak == 47 && !logical->diag_reported_silent) {
             logical->diag_reported_silent = true;
-            LOG_ERROR("[AT9DIAG] voice={} WENT SILENT: 47 consecutive silent superframes at #{} staged={} err={} in_head=0x{:016X} cfg=0x{:08X} ch={} buf={} pos={} discard_s={} discard_e={}",
+            LOG_DEBUG("[AT9DIAG] voice={} WENT SILENT: 47 consecutive silent superframes at #{} staged={} err={} in_head=0x{:016X} cfg=0x{:08X} ch={} buf={} pos={} discard_s={} discard_e={}",
                 fmt::ptr(data.parent), logical->diag_superframes, diag_staged ? 1 : 0, got_decode_error ? 1 : 0,
                 diag_in_head, static_cast<uint32_t>(params->config_data), static_cast<int>(params->channels),
                 state->current_buffer, state->current_byte_position_in_buffer,
@@ -307,12 +307,12 @@ bool Atrac9Module::decode_more_data(KernelState &kern, const MemState &mem, cons
         }
         if (logical->diag_silent_streak == 0) {
             if (logical->heal_done_this_episode)
-                LOG_ERROR("[AT9DIAG] voice={} REVIVED: nonzero output after a recreate (peak={:.4f})", fmt::ptr(data.parent), sf_peak);
+                LOG_DEBUG("[AT9DIAG] voice={} REVIVED: nonzero output after a recreate (peak={:.4f})", fmt::ptr(data.parent), sf_peak);
             logical->heal_done_this_episode = false;
         }
         if (logical->diag_silent_streak >= 12 && (logical->diag_silent_streak % 96) == 12) {
             logical->heal_done_this_episode = true;
-            LOG_ERROR("[AT9DIAG] voice={} DECODER RECREATE at silent streak {} (in_head=0x{:016X})", fmt::ptr(data.parent), logical->diag_silent_streak, diag_in_head);
+            LOG_DEBUG("[AT9DIAG] voice={} DECODER RECREATE at silent streak {} (in_head=0x{:016X})", fmt::ptr(data.parent), logical->diag_silent_streak, diag_in_head);
             std::memset(&logical->saved_state, 0, sizeof(logical->saved_state));
             logical->superframe_staging.clear();
             runtime->decoder = std::make_unique<Atrac9DecoderState>(params->config_data);
@@ -324,7 +324,7 @@ bool Atrac9Module::decode_more_data(KernelState &kern, const MemState &mem, cons
                 const auto &r = logical->diag_ring[(logical->diag_ring_next + k) % 16];
                 ring += fmt::format("\n  sf#{} buf={} pos={} staged={} head=0x{:016X} peak={:.4f}", r.index, r.buf, r.pos, r.staged, r.head, r.peak);
             }
-            LOG_ERROR("[AT9DIAG] voice={} SILENCE ONSET - last 16 superframes (oldest first, onset is where peak dies):{}", fmt::ptr(data.parent), ring);
+            LOG_DEBUG("[AT9DIAG] voice={} SILENCE ONSET - last 16 superframes (oldest first, onset is where peak dies):{}", fmt::ptr(data.parent), ring);
         }
     }
 
@@ -352,7 +352,7 @@ bool Atrac9Module::decode_more_data(KernelState &kern, const MemState &mem, cons
             static std::atomic<uint64_t> resyncs{ 0 };
             const uint64_t n = resyncs.fetch_add(1, std::memory_order_relaxed) + 1;
             if (n <= 8 || (n % 256) == 0)
-                LOG_ERROR("[AT9DIAG] voice={} decode error - resyncing position to next superframe boundary ({} resyncs so far)", fmt::ptr(data.parent), n);
+                LOG_WARN("[AT9DIAG] voice={} decode error - resyncing position to next superframe boundary ({} resyncs so far)", fmt::ptr(data.parent), n);
         }
         state->current_byte_position_in_buffer = pos_after_this_superframe;
         voice_lock.unlock();
@@ -442,7 +442,7 @@ bool Atrac9Module::process(KernelState &kern, const MemState &mem, const SceUID 
     constexpr bool NGS_FINISH_DEAD_STREAMS = true;
     constexpr uint32_t DEAD_STREAM_SILENT_SUPERFRAMES = 700;
     if (NGS_FINISH_DEAD_STREAMS && !is_finished && logical->diag_silent_streak >= DEAD_STREAM_SILENT_SUPERFRAMES) {
-        LOG_ERROR("[NGSLIFE] DEAD-STREAM FINISH voice={} after {} silent superframes (~{}s) - delivering END_OF_DATA so the game reclaims its stream entry",
+        LOG_INFO("[NGSLIFE] DEAD-STREAM FINISH voice={} after {} silent superframes (~{}s) - delivering END_OF_DATA so the game reclaims its stream entry",
             fmt::ptr(data.parent), logical->diag_silent_streak, logical->diag_silent_streak * 21 / 1000);
         voice_lock.unlock();
         scheduler_lock.unlock();

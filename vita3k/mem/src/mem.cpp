@@ -23,6 +23,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <vector>
+
+static thread_local bool g_refused_guest_access = false;
+static std::atomic<bool> g_emulate_refused_jit_access{ false };
+
 #include <cassert>
 #include <cstring>
 #include <mutex>
@@ -124,6 +129,7 @@ bool init(MemState &state, const bool use_page_table) {
 #endif
 
     state.use_page_table = use_page_table;
+    g_emulate_refused_jit_access.store(use_page_table, std::memory_order_relaxed);
     if (use_page_table) {
         state.page_table = PageTable(new PagePtr[TOTAL_MEM_SIZE / KiB(4)]);
         // we use an absolute offset (it is faster), so each entry is the same
@@ -356,7 +362,88 @@ void set_fault_context_provider(std::string (*provider)()) {
     g_fault_context_provider = provider;
 }
 
+static inline uint8_t *guest_host_ptr(const MemState &mem, Address addr) {
+    return mem.use_page_table ? mem.page_table[addr / KiB(4)] + addr : mem.memory.get() + addr;
+}
+
+static inline bool guest_range_contiguous(const MemState &mem, Address addr, uint32_t size) {
+    if (!mem.use_page_table || size <= 1)
+        return true;
+    const uint8_t *const base = mem.page_table[addr / KiB(4)];
+    for (Address page = (addr | 0xFFFu) + 1; page < addr + size; page += KiB(4)) {
+        if (mem.page_table[page / KiB(4)] != base)
+            return false;
+    }
+    return true;
+}
+
+void memcpy_to_guest(MemState &mem, Address dst, const void *src, uint32_t size) {
+    if (!dst || size == 0)
+        return;
+    if (guest_range_contiguous(mem, dst, size)) {
+        memcpy(guest_host_ptr(mem, dst), src, size);
+        return;
+    }
+    const std::shared_lock<std::shared_mutex> transition_lock(mem.external_transition_mutex);
+    const uint8_t *s = static_cast<const uint8_t *>(src);
+    uint32_t off = 0;
+    while (off < size) {
+        const Address cur = dst + off;
+        const uint32_t chunk = std::min<uint32_t>(size - off, static_cast<uint32_t>(KiB(4) - (cur & 0xFFFu)));
+        memcpy(guest_host_ptr(mem, cur), s + off, chunk);
+        off += chunk;
+    }
+}
+
+void memcpy_from_guest(MemState &mem, void *dst, Address src, uint32_t size) {
+    if (!src || size == 0)
+        return;
+    if (guest_range_contiguous(mem, src, size)) {
+        memcpy(dst, guest_host_ptr(mem, src), size);
+        return;
+    }
+    const std::shared_lock<std::shared_mutex> transition_lock(mem.external_transition_mutex);
+    uint8_t *d = static_cast<uint8_t *>(dst);
+    uint32_t off = 0;
+    while (off < size) {
+        const Address cur = src + off;
+        const uint32_t chunk = std::min<uint32_t>(size - off, static_cast<uint32_t>(KiB(4) - (cur & 0xFFFu)));
+        memcpy(d + off, guest_host_ptr(mem, cur), chunk);
+        off += chunk;
+    }
+}
+
+void memmove_guest(MemState &mem, Address dst, Address src, uint32_t size) {
+    if (!dst || !src || size == 0)
+        return;
+    if (guest_range_contiguous(mem, dst, size) && guest_range_contiguous(mem, src, size)) {
+        memmove(guest_host_ptr(mem, dst), guest_host_ptr(mem, src), size);
+        return;
+    }
+    std::vector<uint8_t> temp(size);
+    memcpy_from_guest(mem, temp.data(), src, size);
+    memcpy_to_guest(mem, dst, temp.data(), size);
+}
+
+void memset_guest(MemState &mem, Address dst, int ch, uint32_t size) {
+    if (!dst || size == 0)
+        return;
+    if (guest_range_contiguous(mem, dst, size)) {
+        memset(guest_host_ptr(mem, dst), ch, size);
+        return;
+    }
+    const std::shared_lock<std::shared_mutex> transition_lock(mem.external_transition_mutex);
+    uint32_t off = 0;
+    while (off < size) {
+        const Address cur = dst + off;
+        const uint32_t chunk = std::min<uint32_t>(size - off, static_cast<uint32_t>(KiB(4) - (cur & 0xFFFu)));
+        memset(guest_host_ptr(mem, cur), ch, chunk);
+        off += chunk;
+    }
+}
+
 bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcept {
+    g_refused_guest_access = false;
     const uintptr_t memory_addr = reinterpret_cast<uintptr_t>(state.memory.get());
     const uintptr_t fault_addr = reinterpret_cast<uintptr_t>(addr);
 
@@ -398,6 +485,7 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
         if (invalid_count.fetch_add(1, std::memory_order_relaxed) < 8)
             LOG_CRITICAL("Refused {} to INVALID guest address 0x{:X} (host 0x{:X}){}", write ? "write" : "read", vaddr, fault_addr,
                 g_fault_context_provider ? g_fault_context_provider() : std::string());
+        g_refused_guest_access = true;
         return false;
     }
     if (LOG_PROTECT) {
@@ -410,6 +498,7 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
         if (null_count.fetch_add(1, std::memory_order_relaxed) < 8)
             LOG_CRITICAL("Refused {} to the NULL guard page (guest 0x{:X}){}", write ? "write" : "read", vaddr,
                 g_fault_context_provider ? g_fault_context_provider() : std::string());
+        g_refused_guest_access = true;
         return false;
     }
 
@@ -793,6 +882,92 @@ void deinit_mem(MemState &state) {
 
 #ifdef _WIN32
 
+#include <Zydis/Zydis.h>
+
+static bool rip_in_host_module(const uint64_t rip) noexcept {
+    HMODULE module = nullptr;
+    return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(rip), &module) != 0;
+}
+
+static void zero_context_register(CONTEXT *ctx, const ZydisRegister reg) noexcept {
+    const ZydisRegisterClass cls = ZydisRegisterGetClass(reg);
+    switch (cls) {
+    case ZYDIS_REGCLASS_GPR8:
+    case ZYDIS_REGCLASS_GPR16:
+    case ZYDIS_REGCLASS_GPR32:
+    case ZYDIS_REGCLASS_GPR64: {
+        const ZydisRegister full = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg);
+        const int id = ZydisRegisterGetId(full);
+        if (id < 0 || id > 15)
+            return;
+        DWORD64 *gpr = &reinterpret_cast<DWORD64 *>(&ctx->Rax)[id]; // Rax..R15 are contiguous in CONTEXT
+        if (cls == ZYDIS_REGCLASS_GPR64 || cls == ZYDIS_REGCLASS_GPR32)
+            *gpr = 0; // a 32-bit write zero-extends
+        else if (cls == ZYDIS_REGCLASS_GPR16)
+            *gpr &= ~0xFFFFull;
+        else if (reg == ZYDIS_REGISTER_AH || reg == ZYDIS_REGISTER_CH || reg == ZYDIS_REGISTER_DH || reg == ZYDIS_REGISTER_BH)
+            *gpr &= ~0xFF00ull;
+        else
+            *gpr &= ~0xFFull;
+        break;
+    }
+    case ZYDIS_REGCLASS_XMM: {
+        const int id = ZydisRegisterGetId(reg);
+        if (id < 0 || id > 15)
+            return;
+        M128A *xmm = &(&ctx->Xmm0)[id];
+        xmm->Low = 0;
+        xmm->High = 0;
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+// page-table mode has no fastmem patch to fall back on, so a refused JIT access is emulated like dynarmic's slow path
+static bool emulate_refused_jit_access(PEXCEPTION_POINTERS pExp, const uint8_t *fault_ptr, const bool is_writing) noexcept {
+    CONTEXT *ctx = pExp->ContextRecord;
+    const uint64_t rip = ctx->Rip;
+    if (rip_in_host_module(rip))
+        return false; // a host-side bug, not JIT code: keep it fatal and visible
+
+    ZydisDecoder decoder;
+    if (!ZYAN_SUCCESS(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)))
+        return false;
+    ZydisDecodedInstruction instr;
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, reinterpret_cast<const void *>(rip), 16, &instr, operands)))
+        return false;
+
+    bool mem_read = false, mem_write = false;
+    for (unsigned i = 0; i < instr.operand_count; i++) {
+        if (operands[i].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            mem_read |= (operands[i].actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0;
+            mem_write |= (operands[i].actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0;
+        }
+    }
+    unsigned zeroed = 0;
+    if (mem_read && !mem_write) {
+        for (unsigned i = 0; i < instr.operand_count; i++) {
+            const ZydisDecodedOperand &op = operands[i];
+            if (op.type == ZYDIS_OPERAND_TYPE_REGISTER && (op.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) && op.reg.value != ZYDIS_REGISTER_RFLAGS) {
+                zero_context_register(ctx, op.reg.value);
+                zeroed++;
+            }
+        }
+    }
+    ctx->Rip = rip + instr.length;
+
+    static std::atomic<uint32_t> emulated{ 0 };
+    const uint32_t n = emulated.fetch_add(1, std::memory_order_relaxed);
+    if (n < 16 || (n & 255) == 0)
+        LOG_CRITICAL("[JITFAULT] resumed JIT code after a refused guest {} (#{}): host rip 0x{:X} '{}' ({} bytes, memory {}{}), fault host 0x{:X}, {} register(s) zeroed{}",
+            is_writing ? "write" : "read", n + 1, rip, ZydisMnemonicGetString(instr.mnemonic), instr.length, mem_read ? "R" : "", mem_write ? "W" : "",
+            reinterpret_cast<uintptr_t>(fault_ptr), zeroed, g_fault_context_provider ? g_fault_context_provider() : std::string());
+    return true;
+}
+
 static LONG WINAPI exception_handler(PEXCEPTION_POINTERS pExp) noexcept {
     if (pExp->ExceptionRecord->ExceptionCode == EXCEPTION_BREAKPOINT && IsDebuggerPresent()) {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -802,7 +977,11 @@ static LONG WINAPI exception_handler(PEXCEPTION_POINTERS pExp) noexcept {
     const bool is_executing = pExp->ExceptionRecord->ExceptionInformation[0] == 8;
 
     if (pExp->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && !is_executing) {
+        g_refused_guest_access = false;
         if (access_violation_handler(ptr, is_writing)) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if (g_refused_guest_access && g_emulate_refused_jit_access.load(std::memory_order_relaxed) && emulate_refused_jit_access(pExp, ptr, is_writing)) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }

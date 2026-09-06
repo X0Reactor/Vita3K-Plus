@@ -17,9 +17,15 @@
 
 #include "SceGxm.h"
 
+#include <atomic>
 #include <chrono>
 #include <cpu/functions.h>
 #include <modules/module_parent.h>
+#include <mutex>
+#include <set>
+#include <tuple>
+#include <unordered_map>
+#include <vector>
 
 #include <span>
 #include <stack>
@@ -36,6 +42,7 @@
 #include <gxm/state.h>
 #include <gxm/types.h>
 #include <kernel/state.h>
+#include <mem/functions.h>
 #include <mem/state.h>
 
 #include <io/state.h>
@@ -52,6 +59,8 @@ TRACY_MODULE_NAME(SceGxm);
 
 // Precomputed vertex/fragment state applies to every draw once set on the context, not only sceGxmDrawPrecomputed.
 static constexpr bool use_precomputed_state_on_draw = true;
+
+static constexpr bool deferred_list_restarts_from_installed_buffer = true;
 
 template <>
 std::string to_debug_str<SceGxmColorFormat>(const MemState &mem, SceGxmColorFormat type) {
@@ -972,6 +981,14 @@ static void display_entry_thread(EmuEnvState &emuenv) {
 
 static Ptr<void> gxmRunDeferredMemoryCallback(KernelState &kernel, const MemState &mem, std::mutex &global_lock, std::uint32_t &return_size, Ptr<SceGxmDeferredContextCallback> callback, Ptr<void> userdata,
     const std::uint32_t size, const SceUID thread_id) {
+    if (!callback) {
+        // libgxm would fail the reservation, jumping to address 0 would kill the process
+        static std::atomic<int> reported{ 0 };
+        if (reported.fetch_add(1) < 8)
+            LOG_ERROR("[DEFRING] a deferred context needs {} bytes of {} memory but the game registered no memory callback", size, "ring");
+        return_size = 0;
+        return Ptr<void>();
+    }
     const std::lock_guard<std::mutex> guard(global_lock);
 
     const ThreadStatePtr thread = kernel.get_thread(thread_id);
@@ -1431,6 +1448,8 @@ typedef std::map<VertexProgramCacheKey, Ptr<SceGxmVertexProgram>> VertexProgramC
 struct FragmentProgramCacheKey {
     SceGxmRegisteredProgram fragment_program;
     SceGxmBlendInfo blend_info;
+    SceGxmOutputRegisterFormat output_format;
+    SceGxmMultisampleMode multisample_mode;
 };
 
 typedef std::map<FragmentProgramCacheKey, Ptr<SceGxmFragmentProgram>> FragmentProgramCache;
@@ -1464,6 +1483,170 @@ static const uint8_t mask_gxp[] = {
 
 static constexpr std::uint32_t DEFAULT_RING_SIZE = 4096;
 
+// ---------------------------------------------------------------------------------------------------------
+// seq-214 [DEFRING]/[UBTRACE]: deferred ring bookkeeping and default-uniform-buffer lifetime trace
+// ---------------------------------------------------------------------------------------------------------
+namespace ubtrace {
+static std::atomic<bool> armed{ false };
+// one budget per event class so a chatty class cannot starve the others (seq-214 lost every begin-list and
+// callback line to 24 set-buffer lines per frame)
+static std::atomic<int> budget_set{ 1500 }, budget_begin{ 3000 }, budget_end{ 1500 }, budget_exec{ 1500 }, budget_callback{ 3000 }, budget_wrap{ 500 },
+    budget_reserve{ 8000 }, budget_draw{ 3000 }, budget_diff{ 400 }, budget_udata{ 12000 };
+static std::mutex mtx;
+static std::unordered_map<const SceGxmProgram *, bool> lit_cache;
+struct Snap {
+    Address ub;
+    Address ctx;
+    uint32_t seq;
+    uint32_t count; // words that belong to this draw's program (the rest of a 40-word read is the next entry)
+    uint32_t words[40];
+};
+
+struct InstalledBuffers {
+    Ptr<void> vertex;
+    uint32_t vertex_size = 0;
+    Ptr<void> fragment;
+    uint32_t fragment_size = 0;
+};
+static std::mutex installed_mtx;
+static std::unordered_map<const SceGxmContext *, InstalledBuffers> installed;
+static InstalledBuffers get_installed(const SceGxmContext *ctx) {
+    const std::lock_guard<std::mutex> guard(installed_mtx);
+    auto it = installed.find(ctx);
+    return it == installed.end() ? InstalledBuffers{} : it->second;
+}
+static void set_installed_vertex(const SceGxmContext *ctx, Ptr<void> mem, uint32_t size) {
+    const std::lock_guard<std::mutex> guard(installed_mtx);
+    installed[ctx].vertex = mem;
+    installed[ctx].vertex_size = size;
+}
+static void set_installed_fragment(const SceGxmContext *ctx, Ptr<void> mem, uint32_t size) {
+    const std::lock_guard<std::mutex> guard(installed_mtx);
+    installed[ctx].fragment = mem;
+    installed[ctx].fragment_size = size;
+}
+static std::vector<Snap> snaps;
+static uint32_t draw_seq = 0;
+
+static bool take(std::atomic<int> &b) {
+    return b.fetch_sub(1, std::memory_order_relaxed) > 0;
+}
+
+static bool is_lit(const SceGxmProgram &program) {
+    const std::lock_guard<std::mutex> guard(mtx);
+    auto it = lit_cache.find(&program);
+    if (it != lit_cache.end())
+        return it->second;
+    bool lit = false;
+    const SceGxmProgramParameter *params = program.program_parameters();
+    for (uint32_t i = 0; params && i < program.parameter_count; i++) {
+        if (strcmp(params[i].name(), "MonoOmniLightColour1") == 0) {
+            lit = true;
+            break;
+        }
+    }
+    lit_cache.emplace(&program, lit);
+    return lit;
+}
+
+static std::string words40(const MemState &mem, Address addr, uint32_t *copy_out = nullptr) {
+    uint32_t w[40] = {};
+    if (!addr)
+        return "(null)";
+    if (!debug_safe_copy_guest(mem, addr, w, sizeof(w)))
+        return "(unreadable)";
+    if (copy_out)
+        memcpy(copy_out, w, sizeof(w));
+    std::string out;
+    for (int row = 0; row < 10; row++) {
+        float f[4];
+        memcpy(f, &w[row * 4], sizeof(f));
+        out += fmt::format("{}w{}:[{:.4g} {:.4g} {:.4g} {:.4g}]", row ? " " : "", row * 4, f[0], f[1], f[2], f[3]);
+    }
+    return out;
+}
+
+static Address ctx_addr(const MemState &mem, const SceGxmContext *ctx) {
+    return ctx ? host_to_guest(mem, ctx) : 0;
+}
+
+static const char *ctx_kind(const SceGxmContext *ctx) {
+    return (ctx && ctx->state.type == SCE_GXM_CONTEXT_TYPE_DEFERRED) ? "deferred" : "immediate";
+}
+
+// Called on both draw paths after the uniform buffers were handed to the renderer
+static void on_draw(const MemState &mem, SceGxmContext *context, const char *path, const SceGxmProgram &vgxp, Address vgxp_addr,
+    std::span<UniformBuffer> vert_buffers, std::span<UniformBuffer> frag_buffers, uint32_t index_count) {
+    const bool lit = is_lit(vgxp);
+    if (lit && !armed.exchange(true))
+        LOG_INFO("[UBTRACE] armed: first draw with a MonoOmni-lit vertex program (gxp 0x{:X}); logging every draw's default uniform buffer from here", vgxp_addr);
+    if (!armed.load(std::memory_order_relaxed) || !take(budget_draw))
+        return;
+    const Address vub = vert_buffers.size() > SCE_GXM_DEFAULT_UNIFORM_BUFFER_CONTAINER_INDEX ? vert_buffers[SCE_GXM_DEFAULT_UNIFORM_BUFFER_CONTAINER_INDEX].address() : 0;
+    const Address fub = frag_buffers.size() > SCE_GXM_DEFAULT_UNIFORM_BUFFER_CONTAINER_INDEX ? frag_buffers[SCE_GXM_DEFAULT_UNIFORM_BUFFER_CONTAINER_INDEX].address() : 0;
+    const Address ring = context->state.vertex_ring_buffer.address();
+    uint32_t w[40] = {};
+    const std::string dump = words40(mem, vub, w);
+    const uint32_t seq = ++draw_seq;
+    LOG_INFO("[UBTRACE] draw#{} {} on {} ctx 0x{:X}: vgxp=0x{:X} lit={} default_count={} vert_default_ub=0x{:X} (ring 0x{:X} used={} size={} ub-ring={}) frag_default_ub=0x{:X} indices={} | {}",
+        seq, path, ctx_kind(context), ctx_addr(mem, context), vgxp_addr, lit, vgxp.default_uniform_buffer_count, vub, ring,
+        context->state.vertex_ring_buffer_used, context->state.vertex_ring_buffer_size, vub && ring ? static_cast<int64_t>(vub) - static_cast<int64_t>(ring) : -1,
+        fub, index_count, dump);
+    if (vub && lit) {
+        const std::lock_guard<std::mutex> guard(mtx);
+        if (snaps.size() < 2048) {
+            Snap s;
+            s.ub = vub;
+            s.ctx = ctx_addr(mem, context);
+            s.seq = seq;
+            s.count = std::min<uint32_t>(40, vgxp.default_uniform_buffer_count);
+            memcpy(s.words, w, sizeof(w));
+            snaps.push_back(s);
+        }
+    }
+}
+
+static void verify(const MemState &mem, const char *when, Address ctx) {
+    std::vector<Snap> local;
+    {
+        const std::lock_guard<std::mutex> guard(mtx);
+        if (snaps.empty())
+            return;
+        local.swap(snaps);
+    }
+    uint32_t changed = 0;
+    for (const Snap &s : local) {
+        uint32_t now[40] = {};
+        if (!debug_safe_copy_guest(mem, s.ub, now, sizeof(now)))
+            continue;
+        // only the program's own words count: the tail of a 40-word read is the next reserved entry, which the
+        // game legitimately writes later (seq-214 reported 400 false overwrites on 24-word programs that way)
+        if (memcmp(now, s.words, s.count * sizeof(uint32_t)) == 0)
+            continue;
+        changed++;
+        if (take(budget_diff)) {
+            int first = -1;
+            for (int i = 0; i < 40 && first < 0; i++)
+                if (now[i] != s.words[i])
+                    first = i;
+            Snap before = s;
+            std::string b, a;
+            for (int row = 0; row < 10; row++) {
+                float fb[4], fa[4];
+                memcpy(fb, &before.words[row * 4], sizeof(fb));
+                memcpy(fa, &now[row * 4], sizeof(fa));
+                b += fmt::format("{}[{:.4g} {:.4g} {:.4g} {:.4g}]", row ? " " : "", fb[0], fb[1], fb[2], fb[3]);
+                a += fmt::format("{}[{:.4g} {:.4g} {:.4g} {:.4g}]", row ? " " : "", fa[0], fa[1], fa[2], fa[3]);
+            }
+            LOG_WARN("[UBTRACE] OVERWRITTEN before use: draw#{} default ub 0x{:X} (recorded on ctx 0x{:X}) changed by {} (ctx 0x{:X}), first differing word {} | at draw: {} | now: {}",
+                s.seq, s.ub, s.ctx, when, ctx, first, b, a);
+        }
+    }
+    if (changed)
+        LOG_WARN("[UBTRACE] {}: {} of {} pending lit-draw default uniform buffers were overwritten between the draw call and {}", when, changed, local.size(), when);
+}
+} // namespace ubtrace
+
 static VertexCacheHash hash_data(const void *data, size_t size) {
     auto hash = XXH3_64bits(data, size);
     return static_cast<VertexCacheHash>(hash);
@@ -1494,7 +1677,16 @@ static bool operator<(const FragmentProgramCacheKey &a, const FragmentProgramCac
     if (b.fragment_program < a.fragment_program) {
         return false;
     }
-    return b.blend_info < a.blend_info;
+    if (b.blend_info < a.blend_info) {
+        return true;
+    }
+    if (a.blend_info < b.blend_info) {
+        return false;
+    }
+    if (a.output_format != b.output_format) {
+        return a.output_format < b.output_format;
+    }
+    return a.multisample_mode < b.multisample_mode;
 }
 
 static int init_texture_base(const char *export_name, SceGxmTexture *texture, Ptr<const void> data, SceGxmTextureFormat tex_format, uint32_t width, uint32_t height, uint32_t mipCount,
@@ -1646,8 +1838,24 @@ EXPORT(int, sceGxmBeginCommandList, SceGxmContext *deferredContext) {
         return RET_ERROR(SCE_GXM_ERROR_WITHIN_COMMAND_LIST);
     }
 
+    const Address prev_vring = deferredContext->state.vertex_ring_buffer.address();
+    const uint32_t prev_vused = deferredContext->state.vertex_ring_buffer_used;
+    if (deferred_list_restarts_from_installed_buffer) {
+        // a list starts from what the game installed; a callback chunk taken by the previous list is dropped
+        const ubtrace::InstalledBuffers base = ubtrace::get_installed(deferredContext);
+        deferredContext->state.vertex_ring_buffer = base.vertex;
+        deferredContext->state.vertex_ring_buffer_size = base.vertex_size;
+        deferredContext->state.fragment_ring_buffer = base.fragment;
+        deferredContext->state.fragment_ring_buffer_size = base.fragment_size;
+    }
     deferredContext->state.fragment_ring_buffer_used = 0;
     deferredContext->state.vertex_ring_buffer_used = 0;
+
+    if (ubtrace::take(ubtrace::budget_begin))
+        LOG_INFO("[DEFRING] begin list on ctx 0x{:X}: previous vertex ring 0x{:X} used {} -> start from installed vertex 0x{:X} size {} | fragment 0x{:X} size {} (restart_from_installed={})",
+            ubtrace::ctx_addr(emuenv.mem, deferredContext), prev_vring, prev_vused, deferredContext->state.vertex_ring_buffer.address(),
+            deferredContext->state.vertex_ring_buffer_size, deferredContext->state.fragment_ring_buffer.address(), deferredContext->state.fragment_ring_buffer_size,
+            deferred_list_restarts_from_installed_buffer);
 
     deferredContext->curr_command_list = new SceGxmCommandList();
 
@@ -1661,6 +1869,11 @@ EXPORT(int, sceGxmBeginCommandList, SceGxmContext *deferredContext) {
     if (!deferredContext->state.vertex_ring_buffer) {
         deferredContext->state.vertex_ring_buffer = gxmRunDeferredMemoryCallback(emuenv.kernel, emuenv.mem, emuenv.gxm.callback_lock, deferredContext->state.vertex_ring_buffer_size,
             deferredContext->state.vertex_memory_callback, deferredContext->state.memory_callback_userdata, DEFAULT_RING_SIZE, thread_id);
+        // a fresh buffer starts empty
+        deferredContext->state.vertex_ring_buffer_used = 0;
+        if (ubtrace::take(ubtrace::budget_callback))
+            LOG_INFO("[DEFRING] callback (begin list) vertex buffer for ctx 0x{:X}: asked {} got 0x{:X} size {}", ubtrace::ctx_addr(emuenv.mem, deferredContext), DEFAULT_RING_SIZE,
+                deferredContext->state.vertex_ring_buffer.address(), deferredContext->state.vertex_ring_buffer_size);
 
         if (!deferredContext->state.vertex_ring_buffer) {
             return RET_ERROR(SCE_GXM_ERROR_RESERVE_FAILED);
@@ -1670,6 +1883,10 @@ EXPORT(int, sceGxmBeginCommandList, SceGxmContext *deferredContext) {
     if (!deferredContext->state.fragment_ring_buffer) {
         deferredContext->state.fragment_ring_buffer = gxmRunDeferredMemoryCallback(emuenv.kernel, emuenv.mem, emuenv.gxm.callback_lock, deferredContext->state.fragment_ring_buffer_size,
             deferredContext->state.fragment_memory_callback, deferredContext->state.memory_callback_userdata, DEFAULT_RING_SIZE, thread_id);
+        deferredContext->state.fragment_ring_buffer_used = 0;
+        if (ubtrace::take(ubtrace::budget_callback))
+            LOG_INFO("[DEFRING] callback (begin list) fragment buffer for ctx 0x{:X}: asked {} got 0x{:X} size {}", ubtrace::ctx_addr(emuenv.mem, deferredContext), DEFAULT_RING_SIZE,
+                deferredContext->state.fragment_ring_buffer.address(), deferredContext->state.fragment_ring_buffer_size);
 
         if (!deferredContext->state.fragment_ring_buffer) {
             return RET_ERROR(SCE_GXM_ERROR_RESERVE_FAILED);
@@ -2010,6 +2227,8 @@ EXPORT(int, sceGxmCreateContext, const SceGxmContextParams *params, Ptr<SceGxmCo
     ctx->state.fragment_ring_buffer = params->fragmentRingBufferMem;
     ctx->state.vertex_ring_buffer = params->vertexRingBufferMem;
     ctx->state.fragment_ring_buffer_size = params->fragmentRingBufferMemSize;
+    ubtrace::set_installed_vertex(ctx, params->vertexRingBufferMem, params->vertexRingBufferMemSize);
+    ubtrace::set_installed_fragment(ctx, params->fragmentRingBufferMem, params->fragmentRingBufferMemSize);
     ctx->state.vertex_ring_buffer_size = params->vertexRingBufferMemSize;
 
     ctx->state.type = SCE_GXM_CONTEXT_TYPE_IMMEDIATE;
@@ -2400,6 +2619,8 @@ static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, c
     gxmSetUniformBuffers(*emuenv.renderer, emuenv.gxm, context, fragment_program_gxp, frag_buffers, gxm_fragment_program.renderer_data->uniform_buffer_sizes,
         emuenv.mem);
 
+    ubtrace::on_draw(emuenv.mem, context, "sceGxmDraw", vertex_program_gxp, gxm_vertex_program.program.address(), vert_buffers, frag_buffers, indexCount);
+
     if (context->last_precomputed || pre_vert || pre_frag) {
         // Need to re-set the data
         renderer::set_program(*emuenv.renderer, context->renderer.get(), vert_program_ptr, gxm_vertex_program.renderer_binding, false);
@@ -2553,6 +2774,8 @@ EXPORT(int, sceGxmDrawPrecomputed, SceGxmContext *context, SceGxmPrecomputedDraw
     gxmSetUniformBuffers(*emuenv.renderer, emuenv.gxm, context, fragment_program_gxp, fragment_buffers, fragment_program->renderer_data->uniform_buffer_sizes,
         emuenv.mem);
 
+    ubtrace::on_draw(emuenv.mem, context, "sceGxmDrawPrecomputed", vertex_program_gxp, vertex_program->program.address(), vertex_buffers, fragment_buffers, draw->vertex_count);
+
     // Update vertex data. We should stores a copy of the data to pass it to GPU later, since another scene
     // may start to overwrite stuff when this scene is being processed in our queue (in case of OpenGL).
     uint32_t max_index = 0;
@@ -2655,6 +2878,11 @@ EXPORT(int, sceGxmEndCommandList, SceGxmContext *deferredContext, SceGxmCommandL
     deferredContext->insert_new_memory_range();
     deferredContext->curr_command_list = nullptr;
 
+    if (ubtrace::take(ubtrace::budget_end))
+        LOG_INFO("[DEFRING] end list on ctx 0x{:X}: vertex ring used={} of {} | fragment ring used={} of {}", ubtrace::ctx_addr(emuenv.mem, deferredContext),
+            deferredContext->state.vertex_ring_buffer_used, deferredContext->state.vertex_ring_buffer_size, deferredContext->state.fragment_ring_buffer_used,
+            deferredContext->state.fragment_ring_buffer_size);
+
     // Reset active state
     deferredContext->state.active = false;
     deferredContext->reset_recording();
@@ -2681,6 +2909,8 @@ EXPORT(int, sceGxmEndScene, SceGxmContext *context, SceGxmNotification *vertexNo
     }
 
     SceGxmNotification empty_notification = { Ptr<uint32_t>(0), 0 };
+
+    ubtrace::verify(emuenv.mem, "sceGxmEndScene", ubtrace::ctx_addr(emuenv.mem, context));
 
     // Add command to end the scene
     guest_sched_release_for_block();
@@ -2719,6 +2949,10 @@ EXPORT(int, sceGxmExecuteCommandList, SceGxmContext *context, SceGxmCommandList 
 
     if (!commandList || !commandList->list)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
+
+    if (ubtrace::take(ubtrace::budget_exec))
+        LOG_INFO("[DEFRING] execute list 0x{:X} on immediate ctx 0x{:X}", host_to_guest(emuenv.mem, commandList), ubtrace::ctx_addr(emuenv.mem, context));
+    ubtrace::verify(emuenv.mem, "sceGxmExecuteCommandList", ubtrace::ctx_addr(emuenv.mem, context));
 
     // Emit a jump to the first command of given command list
     // Since only one immediate context exists per process, direct linking like this should be fine! (I hope)
@@ -3701,6 +3935,9 @@ EXPORT(int, sceGxmReserveFragmentDefaultUniformBuffer, SceGxmContext *context, P
         if (context->state.type != SCE_GXM_CONTEXT_TYPE_IMMEDIATE) {
             context->state.fragment_ring_buffer = gxmRunDeferredMemoryCallback(emuenv.kernel, emuenv.mem, emuenv.gxm.callback_lock, context->state.fragment_ring_buffer_size,
                 context->state.fragment_memory_callback, context->state.memory_callback_userdata, DEFAULT_RING_SIZE, thread_id);
+            if (ubtrace::take(ubtrace::budget_callback))
+                LOG_INFO("[DEFRING] callback (fragment ring full at used={} need={}) for ctx 0x{:X}: got 0x{:X} size {}", context->state.fragment_ring_buffer_used, size,
+                    ubtrace::ctx_addr(emuenv.mem, context), context->state.fragment_ring_buffer.address(), context->state.fragment_ring_buffer_size);
 
             if (!context->state.fragment_ring_buffer) {
                 return RET_ERROR(SCE_GXM_ERROR_RESERVE_FAILED);
@@ -3746,10 +3983,15 @@ EXPORT(int, sceGxmReserveVertexDefaultUniformBuffer, SceGxmContext *context, Ptr
         if (context->state.type != SCE_GXM_CONTEXT_TYPE_IMMEDIATE) {
             context->state.vertex_ring_buffer = gxmRunDeferredMemoryCallback(emuenv.kernel, emuenv.mem, emuenv.gxm.callback_lock, context->state.vertex_ring_buffer_size,
                 context->state.vertex_memory_callback, context->state.memory_callback_userdata, DEFAULT_RING_SIZE, thread_id);
+            if (ubtrace::take(ubtrace::budget_callback))
+                LOG_INFO("[DEFRING] callback (vertex ring full at used={} need={}) for ctx 0x{:X}: got 0x{:X} size {}", context->state.vertex_ring_buffer_used, size,
+                    ubtrace::ctx_addr(emuenv.mem, context), context->state.vertex_ring_buffer.address(), context->state.vertex_ring_buffer_size);
 
             if (!context->state.vertex_ring_buffer) {
                 return RET_ERROR(SCE_GXM_ERROR_RESERVE_FAILED);
             }
+        } else if (ubtrace::take(ubtrace::budget_wrap)) {
+            LOG_INFO("[DEFRING] immediate vertex ring wrapped at used={} size={} (need {})", context->state.vertex_ring_buffer_used, context->state.vertex_ring_buffer_size, size);
         }
 
         context->state.vertex_ring_buffer_used = 0;
@@ -3758,6 +4000,11 @@ EXPORT(int, sceGxmReserveVertexDefaultUniformBuffer, SceGxmContext *context, Ptr
     *uniformBuffer = context->state.vertex_ring_buffer.cast<uint8_t>() + static_cast<int32_t>(context->state.vertex_ring_buffer_used);
     context->was_vert_default_uniform_reserved = true;
     context->state.vertex_uniform_buffers[SCE_GXM_DEFAULT_UNIFORM_BUFFER_CONTAINER_INDEX] = *uniformBuffer;
+
+    if (ubtrace::armed.load(std::memory_order_relaxed) && ubtrace::take(ubtrace::budget_reserve))
+        LOG_INFO("[DEFRING] reserve vertex default ub on {} ctx 0x{:X}: gxp=0x{:X} bytes={} -> 0x{:X} (ring 0x{:X} used {} of {})", ubtrace::ctx_kind(context),
+            ubtrace::ctx_addr(emuenv.mem, context), vertex_program->program.address(), size, uniformBuffer->address(), context->state.vertex_ring_buffer.address(),
+            context->state.vertex_ring_buffer_used, context->state.vertex_ring_buffer_size);
 
     return 0;
 }
@@ -3916,9 +4163,12 @@ EXPORT(int, sceGxmSetDeferredContextFragmentBuffer, SceGxmContext *deferredConte
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
     }
 
-    // Use the one specified
     deferredContext->state.fragment_ring_buffer = mem;
     deferredContext->state.fragment_ring_buffer_size = size;
+    deferredContext->state.fragment_ring_buffer_used = 0;
+    ubtrace::set_installed_fragment(deferredContext, mem, size);
+    if (ubtrace::take(ubtrace::budget_set))
+        LOG_INFO("[DEFRING] set fragment buffer on ctx 0x{:X}: mem=0x{:X} size={}", ubtrace::ctx_addr(emuenv.mem, deferredContext), mem.address(), size);
 
     return 0;
 }
@@ -3969,9 +4219,12 @@ EXPORT(int, sceGxmSetDeferredContextVertexBuffer, SceGxmContext *deferredContext
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
     }
 
-    // Use the one specified
     deferredContext->state.vertex_ring_buffer = mem;
     deferredContext->state.vertex_ring_buffer_size = size;
+    deferredContext->state.vertex_ring_buffer_used = 0;
+    ubtrace::set_installed_vertex(deferredContext, mem, size);
+    if (ubtrace::take(ubtrace::budget_set))
+        LOG_INFO("[DEFRING] set vertex buffer on ctx 0x{:X}: mem=0x{:X} size={}", ubtrace::ctx_addr(emuenv.mem, deferredContext), mem.address(), size);
 
     return 0;
 }
@@ -4230,6 +4483,12 @@ EXPORT(int, sceGxmSetUniformDataF, void *uniformBuffer, const SceGxmProgramParam
 
     if (parameter->category != SceGxmParameterCategory::SCE_GXM_PARAMETER_CATEGORY_UNIFORM)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+
+    if (ubtrace::armed.load(std::memory_order_relaxed) && ubtrace::take(ubtrace::budget_udata))
+        LOG_INFO("[UBTRACE] SetUniformDataF '{}' (type {} comps {} array {} container {} res {}) offset {} count {} -> buffer 0x{:X} data [{:.4g} {:.4g} {:.4g} {:.4g}]",
+            parameter->name(), static_cast<int>(parameter->type), parameter->component_count, parameter->array_size, parameter->container_index, parameter->resource_index,
+            componentOffset, componentCount, host_to_guest(emuenv.mem, uniformBuffer), sourceData[0], componentCount > 1 ? sourceData[1] : 0.0f,
+            componentCount > 2 ? sourceData[2] : 0.0f, componentCount > 3 ? sourceData[3] : 0.0f);
 
     size_t size = 0;
     size_t offset = 0;
@@ -4632,7 +4891,9 @@ EXPORT(int, sceGxmShaderPatcherCreateFragmentProgram, SceGxmShaderPatcher *shade
     };
     const FragmentProgramCacheKey key = {
         *programId,
-        (blendInfo != nullptr) ? *blendInfo : default_blend_info
+        (blendInfo != nullptr) ? *blendInfo : default_blend_info,
+        outputFormat,
+        multisampleMode
     };
     FragmentProgramCache::const_iterator cached = shaderPatcher->fragment_program_cache.find(key);
     if (cached != shaderPatcher->fragment_program_cache.end()) {
@@ -4651,8 +4912,20 @@ EXPORT(int, sceGxmShaderPatcherCreateFragmentProgram, SceGxmShaderPatcher *shade
     fp->is_maskupdate = false;
     fp->program = programId->program;
 
+    {
+        static std::mutex fragout_mutex;
+        static std::set<std::tuple<Address, int, int>> fragout_seen;
+        const SceGxmProgram &gxp = *programId->program.get(mem);
+        const std::lock_guard<std::mutex> fragout_lock(fragout_mutex);
+        if (fragout_seen.emplace(programId->program.address(), static_cast<int>(outputFormat), static_cast<int>(multisampleMode)).second)
+            LOG_INFO("[FRAGOUT] patcher: fragment program at 0x{:X} ({} bytes, flags 0x{:X}, native_color={} frag_color={} output_in_declared_format={}) declared output type {} x{}, requested register format {}, msaa mode {}",
+                programId->program.address(), gxp.size, gxp.program_flags, gxp.is_native_color(), gxp.is_frag_color_used(), gxp.writes_output_in_declared_format(),
+                static_cast<int>(gxp.get_fragment_output_type()), gxp.get_fragment_output_component_count(),
+                to_debug_str(mem, outputFormat), static_cast<int>(multisampleMode));
+    }
+
     std::unique_ptr<renderer::FragmentProgram> renderer_data;
-    if (!renderer::create(renderer_data, *emuenv.renderer, *programId->program.get(mem), blendInfo, emuenv.renderer->gxp_ptr_map)) {
+    if (!renderer::create(renderer_data, *emuenv.renderer, *programId->program.get(mem), blendInfo, emuenv.renderer->gxp_ptr_map, outputFormat, multisampleMode)) {
         return RET_ERROR(SCE_GXM_ERROR_DRIVER);
     }
     fp->renderer_data = std::move(renderer_data);

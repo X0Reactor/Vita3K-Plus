@@ -160,6 +160,7 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
         glBindFramebuffer(GL_FRAMEBUFFER, context.render_target->maskbuffer[0]);
     }
     frag_ublock.writing_mask = context.record.writing_mask;
+    frag_ublock.color_write_mask = static_cast<float>(context.record.fragment_program_binding->fragment_program->color_write_mask);
     frag_ublock.use_raw_image = static_cast<float>(use_raw_image);
     frag_ublock.res_multiplier = renderer.res_multiplier;
     const bool has_msaa = context.render_target->multisample_mode;

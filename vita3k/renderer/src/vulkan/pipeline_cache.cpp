@@ -34,7 +34,9 @@
 #include <array>
 #include <bit>
 #include <mutex>
+#include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 
 #include <SDL3/SDL_cpuinfo.h>
@@ -1466,6 +1468,19 @@ vk::Pipeline PipelineCache::retrieve_pipeline(VKContext &context, SceGxmPrimitiv
     // update the shader hints
     context.shader_hints.color_format = record.color_surface.colorFormat;
     context.shader_hints.attributes = &vertex_program_binding->attributes;
+    context.shader_hints.output_register_format = fragment_program_binding->fragment_program
+        ? fragment_program_binding->fragment_program->output_register_format
+        : SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED;
+    // a native-colour program's register format has to agree with the surface it is drawn to
+    if (context.shader_hints.output_register_format != SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED) {
+        static std::mutex fragout_mutex;
+        static std::set<std::tuple<const SceGxmProgram *, uint32_t, int>> fragout_seen;
+        const std::lock_guard<std::mutex> fragout_lock(fragout_mutex);
+        if (fragout_seen.emplace(gxm_fragment_shader, static_cast<uint32_t>(record.color_surface.colorFormat), static_cast<int>(context.shader_hints.output_register_format)).second)
+            LOG_INFO("[FRAGOUT] draw: fragment program {} register format {} on colour surface format 0x{:X} (msaa mode {}, native_color={})",
+                hex_string(fragment_program_binding->fragment_program->hash).substr(0, 12), static_cast<int>(context.shader_hints.output_register_format),
+                static_cast<uint32_t>(record.color_surface.colorFormat), static_cast<int>(fragment_program_binding->fragment_program->multisample_mode), gxm_fragment_shader->is_native_color());
+    }
 
     constexpr bool log_texture_hint_changes = false; // costs a mutex + map lookup per draw
     if constexpr (log_texture_hint_changes) {

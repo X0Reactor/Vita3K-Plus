@@ -173,7 +173,7 @@ Java_org_vita3k_emulator_NativeLib_prepareFrontend(JNIEnv *, jclass) {
 JNIEXPORT void JNICALL
 Java_org_vita3k_emulator_NativeLib_onTrimMemory(JNIEnv *, jclass, jint level) {
     // Android is warning it may reclaim memory and/or kill us
-    LOG_WARN("[ANDROID MEMORY] onTrimMemory level={} - OS under memory pressure, an OOM kill may follow", static_cast<int>(level));
+    LOG_INFO("[ANDROID MEMORY] onTrimMemory level={} - OS under memory pressure, an OOM kill may follow", static_cast<int>(level));
     mem_diag::log_memory_snapshot("onTrimMemory");
     logging::flush();
 

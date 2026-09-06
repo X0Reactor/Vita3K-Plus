@@ -43,6 +43,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <mem/functions.h>
 
 enum class TimerFlags : uint32_t {
     FIFO_THREAD = 0x00000000,
@@ -156,9 +157,9 @@ EXPORT(int, sceClibMemcmpConstTime) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(Ptr<void>, sceClibMemcpy, Ptr<void> dst, const void *src, SceSize len) {
+EXPORT(Ptr<void>, sceClibMemcpy, Ptr<void> dst, Ptr<void> src, SceSize len) {
     TRACY_FUNC(sceClibMemcpy, dst, src, len);
-    memcpy(dst.get(emuenv.mem), src, len);
+    memmove_guest(emuenv.mem, dst.address(), src.address(), len); // page-aware in Page Table mode
     return dst;
 }
 
@@ -182,7 +183,7 @@ EXPORT(Ptr<void>, sceClibMemcpy_safe, Ptr<void> dst, const Ptr<void> src, SceSiz
     if (dst.address() == src.address()) {
         LOG_ERROR("sceClibMemcpy({},{},{}) src == dst", log_hex_full(src.address()), log_hex_full(dst.address()), len);
         assert(false);
-        CALL_EXPORT(sceClibMemcpy, dst, src.get(emuenv.mem), len);
+        CALL_EXPORT(sceClibMemcpy, dst, src, len);
         return dst;
     }
     const auto diff = std::abs((int)(src.address() - dst.address()));
@@ -190,13 +191,13 @@ EXPORT(Ptr<void>, sceClibMemcpy_safe, Ptr<void> dst, const Ptr<void> src, SceSiz
         LOG_ERROR("sceClibMemcpy({},{},{}) src/dst overlap", log_hex_full(src.address()), log_hex_full(dst.address()), len);
         assert(false);
     }
-    CALL_EXPORT(sceClibMemcpy, dst, src.get(emuenv.mem), len);
+    CALL_EXPORT(sceClibMemcpy, dst, src, len);
     return dst;
 }
 
-EXPORT(Ptr<void>, sceClibMemmove, Ptr<void> dst, const void *src, SceSize len) {
+EXPORT(Ptr<void>, sceClibMemmove, Ptr<void> dst, Ptr<void> src, SceSize len) {
     TRACY_FUNC(sceClibMemmove, dst, src, len);
-    memmove(dst.get(emuenv.mem), src, len);
+    memmove_guest(emuenv.mem, dst.address(), src.address(), len);
     return dst;
 }
 
@@ -207,7 +208,7 @@ EXPORT(int, sceClibMemmoveChk) {
 
 EXPORT(Ptr<void>, sceClibMemset, Ptr<void> dst, int ch, SceSize len) {
     TRACY_FUNC(sceClibMemset, dst, ch, len);
-    memset(dst.get(emuenv.mem), ch, len);
+    memset_guest(emuenv.mem, dst.address(), ch, len);
     return dst;
 }
 

@@ -200,6 +200,77 @@ static spv::Id get_type_array(spv::Builder &b, const Input &input) {
     return param_id;
 }
 
+static const char *output_register_format_name(const SceGxmOutputRegisterFormat format) {
+    switch (format) {
+    case SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED: return "DECLARED";
+    case SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4: return "UCHAR4";
+    case SCE_GXM_OUTPUT_REGISTER_FORMAT_CHAR4: return "CHAR4";
+    case SCE_GXM_OUTPUT_REGISTER_FORMAT_USHORT2: return "USHORT2";
+    case SCE_GXM_OUTPUT_REGISTER_FORMAT_SHORT2: return "SHORT2";
+    case SCE_GXM_OUTPUT_REGISTER_FORMAT_HALF4: return "HALF4";
+    case SCE_GXM_OUTPUT_REGISTER_FORMAT_HALF2: return "HALF2";
+    case SCE_GXM_OUTPUT_REGISTER_FORMAT_FLOAT2: return "FLOAT2";
+    case SCE_GXM_OUTPUT_REGISTER_FORMAT_FLOAT: return "FLOAT";
+    default: return "?";
+    }
+}
+
+static bool requested_format_packs_integer(const SceGxmOutputRegisterFormat format, DataType &packed) {
+    switch (format) {
+    case SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4:
+        packed = DataType::UINT8;
+        return true;
+    case SCE_GXM_OUTPUT_REGISTER_FORMAT_CHAR4:
+        packed = DataType::INT8;
+        return true;
+    case SCE_GXM_OUTPUT_REGISTER_FORMAT_USHORT2:
+        packed = DataType::UINT16;
+        return true;
+    case SCE_GXM_OUTPUT_REGISTER_FORMAT_SHORT2:
+        packed = DataType::INT16;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static DataType fragment_output_register_type(const SceGxmProgram &program, const Hints *hints, const std::string &hash, DataType *declared_out = nullptr, const bool log = true) {
+    DataType declared = std::get<0>(shader::get_parameter_type_store_and_name(program.get_fragment_output_type()));
+    if (declared == DataType::INT32 || declared == DataType::UINT32)
+        declared = DataType::F32;
+    if (declared_out)
+        *declared_out = declared;
+
+    const SceGxmOutputRegisterFormat requested = hints ? hints->output_register_format : SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED;
+    DataType type = declared;
+    DataType packed = declared;
+    const char *why = "  [no packed format requested]";
+    if (!program.is_native_color()) {
+        why = "  [non-native: the patcher epilogue converts on hardware, the register holds the declared type]";
+    } else if (program.writes_output_in_declared_format()) {
+        why = "  [declared type kept: the patcher would convert, so the attachment converts here]";
+    } else if (!is_float_data_type(declared)) {
+        why = "  [integer declared type kept: the compiler already packed it]";
+    } else if (requested_format_packs_integer(requested, packed)) {
+        type = packed;
+        why = "  [requested packed format applied; the body's last write to o0 decides at run time]";
+    }
+
+    if (log && requested != SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED)
+        LOG_INFO("[FRAGOUT] shader {}: declared output type {} x{}, patcher register format {}, flags 0x{:X} output_in_declared_format={} -> o0 read as data type {} (native_color={} frag_color={}){}",
+            hash, static_cast<int>(program.get_fragment_output_type()), program.get_fragment_output_component_count(),
+            output_register_format_name(requested), program.program_flags, program.writes_output_in_declared_format(), static_cast<int>(type),
+            program.is_native_color(), program.is_frag_color_used(), why);
+
+    return type;
+}
+
+// true when the decode differs from the declared type, i.e. the run-time o0 layout flag is needed
+static bool fragment_output_uses_requested_format(const SceGxmProgram &program, const Hints *hints, const std::string &hash) {
+    DataType declared = DataType::F32;
+    return fragment_output_register_type(program, hints, hash, &declared, false) != declared;
+}
+
 static spv::Id get_param_type(spv::Builder &b, const Input &input) {
     switch (input.generic_type) {
     case GenericType::SCALER:
@@ -829,11 +900,8 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
 
         target_to_store.bank = RegisterBank::OUTPUT;
         target_to_store.num = 0;
-        target_to_store.type = std::get<0>(shader::get_parameter_type_store_and_name(program.get_fragment_output_type()));
-
-        // see frag_finalize for the following cases
-        if (target_to_store.type == DataType::INT32 || target_to_store.type == DataType::UINT32)
-            target_to_store.type = DataType::F32;
+        // the framebuffer value a blending program reads from o0 must be laid out the way its code expects
+        target_to_store.type = fragment_output_register_type(program, translation_state.hints, translation_state.hash);
 
         if (gxm::get_base_format(translation_state.hints->color_format) == SCE_GXM_COLOR_BASE_FORMAT_F32F32 && vertex_varyings_ptr->output_comp_count > 2) {
             if (target_to_store.type == DataType::F16)
@@ -1207,7 +1275,7 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
     }
 
     if (program_type == SceGxmProgramType::Fragment) {
-        std::vector<spv::Id> uniform_composition = { f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32 };
+        std::vector<spv::Id> uniform_composition = { f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32 };
         if (uniform_buffer_count > 0)
             uniform_composition.push_back(buffer_addresses_type);
         if (uniform_texture_count > 0) {
@@ -1237,6 +1305,7 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
         ADD_FRAG_UNIFORM_MEMBER(inv_frag_height);
         ADD_FRAG_UNIFORM_MEMBER(raw_cast_mask);
         ADD_FRAG_UNIFORM_MEMBER(iterator_written_mask);
+        ADD_FRAG_UNIFORM_MEMBER(color_write_mask);
 
 #undef ADD_FRAG_UNIFORM_MEMBER
         // the resolution multiplier does not require a high precision
@@ -1618,17 +1687,14 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
         spv::NoPrecision, b.makeVoidType(), "frag_output_finalize", {}, {},
         decorations, &frag_fin_block);
 
-    const SceGxmParameterType param_type = program.get_fragment_output_type();
     auto vertex_varyings_ptr = program.vertex_varyings();
 
     Operand color_val_operand;
     color_val_operand.bank = program.is_native_color() ? RegisterBank::OUTPUT : RegisterBank::PRIMATTR;
     color_val_operand.num = 0;
     color_val_operand.swizzle = SWIZZLE_CHANNEL_4_DEFAULT;
-    color_val_operand.type = std::get<0>(shader::get_parameter_type_store_and_name(param_type));
-    // if the shader tries to write a INT32 or UINT32, it means the raw content
-    if (color_val_operand.type == DataType::INT32 || color_val_operand.type == DataType::UINT32)
-        color_val_operand.type = DataType::F32;
+    DataType declared_output_type = DataType::F32;
+    color_val_operand.type = fragment_output_register_type(program, translate_state.hints, translate_state.hash, &declared_output_type);
 
     // if the output component count is greater than the surface component count,
     // it means we must pack multiple components (with lower precision) into one of the surface component
@@ -1636,6 +1702,8 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
     if (gxm::get_base_format(translate_state.hints->color_format) == SCE_GXM_COLOR_BASE_FORMAT_F32F32 && vertex_varyings_ptr->output_comp_count > 2) {
         if (color_val_operand.type == DataType::F16)
             color_val_operand.type = DataType::F32;
+        if (declared_output_type == DataType::F16)
+            declared_output_type = DataType::F32;
     }
 
     spv::Decoration precision = (get_data_type_size(color_val_operand.type) < 4 && !features.force_full_precision) ? spv::DecorationRelaxedPrecision : spv::NoPrecision;
@@ -1658,11 +1726,44 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
     if (!is_float_data_type(color_val_operand.type))
         color = utils::convert_to_float(b, utils, color, color_val_operand.type, true);
 
+    if (parameters.frag_output_holds_declared_type != 0 && color_val_operand.type != declared_output_type) {
+        Operand declared_operand = color_val_operand;
+        declared_operand.type = declared_output_type;
+        spv::Id declared_color = utils::load(b, parameters, utils, features, declared_operand, 0xF, reg_off);
+        if (!is_float_data_type(declared_output_type))
+            declared_color = utils::convert_to_float(b, utils, declared_color, declared_output_type, true);
+        const spv::Id holds_declared = b.createLoad(parameters.frag_output_holds_declared_type, spv::NoPrecision);
+        const spv::Id holds_declared4 = b.createCompositeConstruct(b.makeVectorType(b.makeBoolType(), 4), { holds_declared, holds_declared, holds_declared, holds_declared });
+        color = b.createTriOp(spv::OpSelect, b.getTypeId(color), holds_declared4, declared_color, color);
+    }
+
     if (program.is_frag_color_used() && features.should_use_shader_interlock()) {
         spv::Id signed_i32 = b.makeIntType(32);
         spv::Id coord_id = b.createLoad(translate_state.frag_coord_id, spv::NoPrecision);
         spv::Id translated_id = b.createUnaryOp(spv::OpConvertFToS, b.makeVectorType(signed_i32, 4), coord_id);
         translated_id = b.createOp(spv::OpVectorShuffle, b.makeVectorType(signed_i32, 2), { { true, translated_id }, { true, translated_id }, { false, 0 }, { false, 1 } });
+
+        // The pipeline applies the colour write mask to an attachment, but a storage-image write bypasses
+        // it. Colour mask none is how a game lays down depth or stencil while a colour shader stays bound.
+        const spv::Id u32 = b.makeUintType(32);
+        const spv::Id bool_type = b.makeBoolType();
+        const spv::Id bvec4 = b.makeVectorType(bool_type, 4);
+        const spv::Id v4f = b.makeVectorType(b.makeFloatType(32), 4);
+        const spv::Id mask_ptr = utils::create_access_chain(b, spv::StorageClassUniform, translate_state.render_info_id, { b.makeIntConstant(FRAG_UNIFORM_color_write_mask) });
+        const spv::Id mask_u = b.createUnaryOp(spv::OpConvertFToU, u32, b.createLoad(mask_ptr, spv::NoPrecision));
+        const spv::Id any_channel = b.createBinOp(spv::OpINotEqual, bool_type, mask_u, b.makeUintConstant(0));
+        spv::Builder::If mask_builder(any_channel, spv::SelectionControlMaskNone, b);
+
+        std::vector<spv::Id> channel_enabled;
+        for (uint32_t channel = 0; channel < 4; channel++) {
+            const spv::Id bit = b.createBinOp(spv::OpBitwiseAnd, u32, mask_u, b.makeUintConstant(1u << channel));
+            channel_enabled.push_back(b.createBinOp(spv::OpINotEqual, bool_type, bit, b.makeUintConstant(0)));
+        }
+        const spv::Id channel_mask = b.createCompositeConstruct(bvec4, channel_enabled);
+        const spv::Id dst_color = b.createOp(spv::OpImageRead, v4f, { b.createLoad(translate_state.color_attachment_id, spv::NoPrecision), translated_id });
+        const auto merge_with_dst = [&](const spv::Id new_color) {
+            return b.createTriOp(spv::OpSelect, v4f, channel_mask, new_color, dst_color);
+        };
 
         if (translate_state.is_vulkan) {
             spv::Id old_color = color;
@@ -1677,14 +1778,14 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
             rgb = srgb_encode_rgb(b, utils, rgb);
             color = b.createOp(spv::OpVectorShuffle, v4, { { true, rgb }, { true, color }, { false, 0 }, { false, 1 }, { false, 2 }, { false, 6 } });
 
-            b.createNoResultOp(spv::OpImageWrite, { b.createLoad(translate_state.color_attachment_id, spv::NoPrecision), translated_id, color });
+            b.createNoResultOp(spv::OpImageWrite, { b.createLoad(translate_state.color_attachment_id, spv::NoPrecision), translated_id, merge_with_dst(color) });
 
             // else (no shader gamma correction, nothing to do)
             cond_builder.makeBeginElse();
-            b.createNoResultOp(spv::OpImageWrite, { b.createLoad(translate_state.color_attachment_id, spv::NoPrecision), translated_id, old_color });
+            b.createNoResultOp(spv::OpImageWrite, { b.createLoad(translate_state.color_attachment_id, spv::NoPrecision), translated_id, merge_with_dst(old_color) });
             cond_builder.makeEndIf();
         } else {
-            b.createNoResultOp(spv::OpImageWrite, { b.createLoad(translate_state.color_attachment_id, spv::NoPrecision), translated_id, color });
+            b.createNoResultOp(spv::OpImageWrite, { b.createLoad(translate_state.color_attachment_id, spv::NoPrecision), translated_id, merge_with_dst(color) });
         }
 
         if (features.preserve_f16_nan_as_u16) {
@@ -1695,10 +1796,15 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
             color_val_operand.type = DataType::UINT16;
             color = utils::load(b, parameters, utils, features, color_val_operand, 0xF, reg_off);
 
-            b.createNoResultOp(spv::OpImageWrite, { b.createLoad(translate_state.color_attachment_raw_id, spv::NoPrecision), translated_id, color });
+            const spv::Id uiv4 = b.makeVectorType(u32, 4);
+            const spv::Id dst_raw = b.createOp(spv::OpImageRead, uiv4, { b.createLoad(translate_state.color_attachment_raw_id, spv::NoPrecision), translated_id });
+            const spv::Id merged_raw = b.createTriOp(spv::OpSelect, uiv4, channel_mask, color, dst_raw);
+            b.createNoResultOp(spv::OpImageWrite, { b.createLoad(translate_state.color_attachment_raw_id, spv::NoPrecision), translated_id, merged_raw });
 
             raw_cond_builder.makeEndIf();
         }
+
+        mask_builder.makeEndIf();
     } else {
         spv::Id out = b.createVariable(precision, spv::StorageClassOutput, b.makeVectorType(b.makeFloatType(32), 4), "out_color");
         translate_state.interfaces.push_back(out);
@@ -2117,6 +2223,12 @@ static SpirvCode convert_gxp_to_spirv_impl(const SceGxmProgram &program, const s
     // Generate parameters
     SpirvShaderParameters parameters = create_parameters(b, program, utils, features, translation_state, program_type, texture_queries);
 
+    if (program.is_fragment() && translation_state.hints && fragment_output_uses_requested_format(program, translation_state.hints, translation_state.hash)) {
+        parameters.frag_output_holds_declared_type = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, b.makeBoolType(), "o0_holds_declared_type", b.makeBoolConstant(false));
+        LOG_INFO("[FRAGOUT] shader {}: native colour, patcher register format {}: o0 layout decided by the program's last write to it (typed float result -> declared type, raw move or integer -> requested format)",
+            translation_state.hash, output_register_format_name(translation_state.hints->output_register_format));
+    }
+
     if (!translation_state.is_maskupdate) {
         if (program.is_fragment()) {
             if (!translation_state.is_vulkan)
@@ -2384,6 +2496,30 @@ void convert_gxp_to_glsl_from_filepath(const std::string &shader_filepath_utf8) 
             LOG_INFO("Wrote Vulkan SPIR-V to {} ({} words) - check it with: spirv-val --target-env vulkan1.1 <file>", spv_path.string(), vk_shader.spirv.size());
         } else {
             LOG_ERROR("Could not write {}", spv_path.string());
+        }
+    }
+
+    // Emit the UCHAR4 and CHAR4 variants for every fragment program so each decode class
+    // can be inspected offline (using spirv-dis, etc) without me having to run the game :)
+    const SceGxmProgram &gxp = *reinterpret_cast<SceGxmProgram *>(gxp_program.data());
+    if (gxp.is_fragment()) {
+        const std::pair<SceGxmOutputRegisterFormat, const char *> variants[] = {
+            { SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4, ".vk.u8.spv" },
+            { SCE_GXM_OUTPUT_REGISTER_FORMAT_CHAR4, ".vk.s8.spv" },
+        };
+        for (const auto &[format, ext] : variants) {
+            Hints variant_hints = hints;
+            variant_hints.output_register_format = format;
+            const GeneratedShader variant = convert_gxp(gxp, shader_filepath_str.filename().string(), vk_features, shader::Target::SpirVVulkan, variant_hints, false, false);
+            if (variant.spirv.empty())
+                continue;
+            fs::path variant_path = shader_filepath_str;
+            variant_path.replace_extension(ext);
+            fs::ofstream variant_file(variant_path, std::ios::binary);
+            if (variant_file) {
+                variant_file.write(reinterpret_cast<const char *>(variant.spirv.data()), static_cast<std::streamsize>(variant.spirv.size() * sizeof(uint32_t)));
+                LOG_INFO("Wrote the {} output-register variant to {} ({} words)", output_register_format_name(format), variant_path.string(), variant.spirv.size());
+            }
         }
     }
 }

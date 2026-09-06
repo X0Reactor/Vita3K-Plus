@@ -107,7 +107,7 @@ static void freeze_watchdog_thread(EmuEnvState &emuenv) {
         if (overshoot > 100000) {
             const double sys_idle_ms = (now.sys_idle_us - prev.sys_idle_us) / 1000.0;
             const double sys_busy_ms = (now.sys_busy_us - prev.sys_busy_us) / 1000.0;
-            LOG_WARN("[FREEZE] {:.0f}ms process-wide stall | page_faults +{} (total {}) | working_set {}MB (delta {}MB) | private {}MB | OUR cpu: user {:.0f}ms kernel {:.0f}ms (= {:.0f}% of one core) | SYSTEM cpu: busy {:.0f}ms idle {:.0f}ms across {} cores (= {:.0f}% busy)",
+            LOG_INFO("[FREEZE] {:.0f}ms process-wide stall | page_faults +{} (total {}) | working_set {}MB (delta {}MB) | private {}MB | OUR cpu: user {:.0f}ms kernel {:.0f}ms (= {:.0f}% of one core) | SYSTEM cpu: busy {:.0f}ms idle {:.0f}ms across {} cores (= {:.0f}% busy)",
                 overshoot / 1000.0,
                 now.page_faults - prev.page_faults, now.page_faults,
                 now.working_set_mb, static_cast<int64_t>(now.working_set_mb) - static_cast<int64_t>(prev.working_set_mb),
@@ -192,6 +192,17 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
             static uint64_t last_stuck_scene_dump_vblank = 0;
             static int stuck_scene_dumps = 0;
             static uint64_t last_seen_vblanks = 0;
+            static uint64_t last_idle_render_dump_vblank = 0;
+            static int idle_render_dumps = 0;
+            const auto renderer_heartbeat = [&]() {
+                if (!emuenv.renderer)
+                    return;
+                const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                LOG_ERROR("RENDERER HEARTBEAT: last command opcode {} {} ms ago, in dormant GPU wait={}, progress={} | wait thread: last request kind {} {} ms ago, fences pending {} | last memory transition {} ms ago",
+                    emuenv.renderer->last_cmd_opcode.load(), now_ms - emuenv.renderer->last_cmd_epoch_ms.load(), emuenv.renderer->in_dormant_wait.load(),
+                    emuenv.renderer->progress_counter.load(), emuenv.renderer->wait_last_kind.load(), now_ms - emuenv.renderer->wait_last_epoch_ms.load(),
+                    emuenv.renderer->wait_fences_pending.load(), now_ms - emuenv.renderer->last_mem_transition_epoch_ms.load());
+            };
             const uint64_t setframe = emuenv.display.last_setframe_vblank_count.load();
             const uint64_t vblanks = emuenv.display.vblank_count.load();
             // vblank_count restarts at 0 each game session (DisplayState::deinit); these statics outlive it, so reset them with it
@@ -210,6 +221,8 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                 last_pipes_change_vblank = 0;
                 last_stuck_scene_dump_vblank = 0;
                 stuck_scene_dumps = 0;
+                last_idle_render_dump_vblank = 0;
+                idle_render_dumps = 0;
             }
             last_seen_vblanks = vblanks;
             const bool unpaused = !emuenv.kernel.is_threads_paused();
@@ -243,6 +256,7 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                     stall_vblanks, never_flipped ? " (game NEVER flipped since boot)" : "", renderer_idle_vblanks, guest_idle_vblanks,
                     emuenv.display.setframe_call_count.load(), emuenv.display.setframe_accept_count.load());
                 emuenv.kernel.log_thread_hang_dump();
+                renderer_heartbeat();
                 LOG_ERROR("HANG DISPLAY QUEUE: depth={} worker_state={} (0=idle-waiting-entry 1=wait-old-sync 2=wait-new-sync 3=running-callback) entries_done={}",
                     emuenv.gxm.display_queue.size(), emuenv.gxm.display_worker_state.load(), emuenv.gxm.display_entries_done.load());
                 emuenv.kernel.log_eventflag_history();
@@ -259,7 +273,7 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
             constexpr uint32_t STUCK_SCENE_MAX_PIPELINES = 32;
             constexpr uint64_t STUCK_SCENE_FROZEN_VBLANKS = 720;
             constexpr uint64_t STUCK_SCENE_REDUMP_VBLANKS = 600;
-            constexpr int STUCK_SCENE_MAX_DUMPS = 1;
+            constexpr int STUCK_SCENE_MAX_DUMPS = 3;
             const uint32_t pipes_now = emuenv.renderer ? emuenv.renderer->diag_pipelines_created() : ~0u;
             const bool pipes_tracked = (pipes_now != ~0u);
             if (pipes_now != last_pipes_value) {
@@ -278,11 +292,25 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                 LOG_ERROR("STUCK-SCENE WATCHDOG (dump {}/{}): presenting ({} SetFrameBuf accepted, renderer still executing commands) but only {} pipeline(s) ever compiled, frozen for {} vblanks (~{}s) — wedged BEFORE scene render; dumping guest threads",
                     stuck_scene_dumps, STUCK_SCENE_MAX_DUMPS, emuenv.display.setframe_accept_count.load(), pipes_now, pipes_frozen_vblanks, pipes_frozen_vblanks / 60);
                 emuenv.kernel.log_thread_hang_dump();
+                renderer_heartbeat();
                 if (stuck_scene_dumps == 1) {
                     LOG_ERROR("STUCK-SCENE DISPLAY QUEUE: depth={} worker_state={} (0=idle-waiting-entry 1=wait-old-sync 2=wait-new-sync 3=running-callback) entries_done={}",
                         emuenv.gxm.display_queue.size(), emuenv.gxm.display_worker_state.load(), emuenv.gxm.display_entries_done.load());
                     emuenv.kernel.log_eventflag_history();
                 }
+            }
+
+            // still flipping (loading spinner) but the renderer has processed nothing for 15 s
+            if (!never_flipped && unpaused && renderer_idle_vblanks >= 900 && idle_render_dumps < 3
+                && (idle_render_dumps == 0 || vblanks - last_idle_render_dump_vblank >= 1800)) {
+                last_idle_render_dump_vblank = vblanks;
+                ++idle_render_dumps;
+                LOG_ERROR("IDLE-RENDER WATCHDOG (dump {}/3): still flipping (SetFrameBuf accepted={}) but the renderer processed nothing for {} vblanks (~{}s); guest wake-idle {} vblanks - dumping guest threads",
+                    idle_render_dumps, emuenv.display.setframe_accept_count.load(), renderer_idle_vblanks, renderer_idle_vblanks / 60, guest_idle_vblanks);
+                emuenv.kernel.log_thread_hang_dump();
+                renderer_heartbeat();
+                LOG_ERROR("IDLE-RENDER DISPLAY QUEUE: depth={} worker_state={} entries_done={}",
+                    emuenv.gxm.display_queue.size(), emuenv.gxm.display_worker_state.load(), emuenv.gxm.display_entries_done.load());
             }
 
             // Cycle breaker
@@ -319,7 +347,7 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                 const bool full_wedge = renderer_idle_vblanks > BREAK_STALL_VBLANKS && guest_idle_vblanks > BREAK_STALL_VBLANKS;
                 const bool partial_wedge = stall_vblanks > BREAK_SLOW_VBLANKS && renderer_idle_vblanks > BREAK_SLOW_VBLANKS;
                 if (!full_wedge && !partial_wedge) {
-                    LOG_WARN("HANG WATCHDOG: no flip for {} vblanks but still alive (renderer executed a command {} vblanks ago, a guest thread woke {} vblanks ago) — breaker suppressed", stall_vblanks, renderer_idle_vblanks, guest_idle_vblanks);
+                    LOG_INFO("HANG WATCHDOG: no flip for {} vblanks but still alive (renderer executed a command {} vblanks ago, a guest thread woke {} vblanks ago) — breaker suppressed", stall_vblanks, renderer_idle_vblanks, guest_idle_vblanks);
                 } else {
                     constexpr int MAX_BREAK_DUMPS_PER_STALL = 3;
                     if (break_dumps_this_stall < MAX_BREAK_DUMPS_PER_STALL) {

@@ -194,6 +194,9 @@ struct ShaderProgram {
 };
 
 struct FragmentProgram : ShaderProgram {
+    SceGxmOutputRegisterFormat output_register_format = SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED;
+    SceGxmMultisampleMode multisample_mode = SCE_GXM_MULTISAMPLE_NONE;
+    uint8_t color_write_mask = 0xF;
 };
 
 struct VertexProgram : ShaderProgram {

@@ -68,7 +68,7 @@ void VoiceScheduler::deque_insert(const MemState &mem, Voice *voice) {
 bool VoiceScheduler::play(const MemState &mem, Voice *voice) {
     if (voice->state != VOICE_STATE_AVAILABLE) {
         static std::atomic<uint64_t> refused{ 0 };
-        LOG_ERROR("[NGSLIFE] VoicePlay REFUSED #{}: voice={} state={} paused={} keyed_off={} pending={}",
+        LOG_WARN("[NGSLIFE] VoicePlay REFUSED #{}: voice={} state={} paused={} keyed_off={} pending={}",
             refused.fetch_add(1, std::memory_order_relaxed) + 1, fmt::ptr(voice),
             static_cast<int>(voice->state), voice->is_paused ? 1 : 0, voice->is_keyed_off ? 1 : 0, voice->is_pending ? 1 : 0);
         return false;
@@ -86,7 +86,7 @@ bool VoiceScheduler::play(const MemState &mem, Voice *voice) {
         static std::atomic<uint64_t> paused_keys{ 0 };
         const uint64_t n = paused_keys.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n <= 3 || (n % 4096) == 0)
-            LOG_WARN("[NGSLIFE] voice={} keyed on while paused ({} so far) - runs at the next resume", fmt::ptr(voice), n);
+            LOG_DEBUG("[NGSLIFE] voice={} keyed on while paused ({} so far) - runs at the next resume", fmt::ptr(voice), n);
     }
     if (!voice->is_paused)
         deque_insert(mem, voice);
@@ -209,7 +209,7 @@ void VoiceScheduler::update(KernelState &kern, const MemState &mem, const SceUID
                                 in_queue ? 1 : 0, rounds * 55 / 10, peak, stream);
                             constexpr bool FORCE_RELEASE_SILENT_VOICES = false;
                             if (FORCE_RELEASE_SILENT_VOICES && peak <= 0.0001f && rounds >= 12) {
-                                LOG_ERROR("[NGSLIFE] FORCING voice={} back to AVAILABLE (silent {}s)", fmt::ptr(v), rounds * 55 / 10);
+                                LOG_WARN("[NGSLIFE] FORCING voice={} back to AVAILABLE (silent {}s)", fmt::ptr(v), rounds * 55 / 10);
                                 if (in_queue)
                                     deque_voice(v);
                                 v->state = VOICE_STATE_AVAILABLE;
@@ -222,9 +222,9 @@ void VoiceScheduler::update(KernelState &kern, const MemState &mem, const SceUID
                     }
                 }
                 if (stuck)
-                    LOG_ERROR("[NGSLIFE] STUCK VOICES ({} of {} busy, {} total): a voice that never finishes can NEVER be replayed:{}", stuck, busy, total, report);
+                    LOG_WARN("[NGSLIFE] STUCK VOICES ({} of {} busy, {} total): a voice that never finishes can NEVER be replayed:{}", stuck, busy, total, report);
                 else
-                    LOG_WARN("[NGSLIFE] voice census (rack-wide): total={} busy={} paused_out_of_queue={} stuck=0", total, busy, paused_out_of_queue);
+                    LOG_INFO("[NGSLIFE] voice census (rack-wide): total={} busy={} paused_out_of_queue={} stuck=0", total, busy, paused_out_of_queue);
             }
         }
     }
@@ -344,7 +344,7 @@ void VoiceScheduler::update(KernelState &kern, const MemState &mem, const SceUID
                 static std::atomic<uint64_t> fin{ 0 };
                 const uint64_t n = fin.fetch_add(1, std::memory_order_relaxed) + 1;
                 if ((n % 128) == 0)
-                    LOG_WARN("[NGSLIFE] voice finishes so far: {} (callback={})", n, voice->finished_callback ? "yes" : "NONE");
+                    LOG_DEBUG("[NGSLIFE] voice finishes so far: {} (callback={})", n, voice->finished_callback ? "yes" : "NONE");
             }
             voice->is_keyed_off = true;
             voice->transition(mem, VOICE_STATE_FINALIZING);

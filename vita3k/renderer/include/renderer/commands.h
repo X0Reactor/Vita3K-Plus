@@ -20,6 +20,7 @@
 #include <cassert>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <vector>
 
 namespace renderer {
@@ -108,6 +109,7 @@ struct Command {
 
     std::uint8_t data[MAX_COMMAND_DATA_SIZE];
     int *status;
+    std::shared_ptr<int> status_keepalive;
 
     Command *next = nullptr;
 };

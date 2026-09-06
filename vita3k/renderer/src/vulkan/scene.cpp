@@ -19,6 +19,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
+#include <set>
 
 #include <gxm/functions.h>
 #include <renderer/functions.h>
@@ -535,6 +537,17 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
 
     auto &frag_ublock = context.curr_frag_ublock.base_block;
     frag_ublock.writing_mask = context.record.writing_mask;
+    {
+        const auto &bound_fragment = context.record.fragment_program_binding->fragment_program;
+        frag_ublock.color_write_mask = static_cast<float>(bound_fragment->color_write_mask);
+        if (bound_fragment->color_write_mask != 0xF && context.record.fragment_program_binding->program()->is_native_color()) {
+            static std::mutex colormask_mutex;
+            static std::set<std::pair<const void *, int>> colormask_seen;
+            const std::lock_guard<std::mutex> colormask_lock(colormask_mutex);
+            if (colormask_seen.emplace(bound_fragment.get(), bound_fragment->color_write_mask).second)
+                LOG_INFO("[COLORMASK] native-colour fragment program {} drawn with colour write mask 0x{:X} (R=1 G=2 B=4 A=8): its storage-image write now honours it", static_cast<const void *>(bound_fragment.get()), bound_fragment->color_write_mask);
+        }
+    }
     frag_ublock.res_multiplier = context.state.res_multiplier;
     frag_ublock.use_raw_image = (context.state.features.preserve_f16_nan_as_u16
                                     && context.record.color_base_format == SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16

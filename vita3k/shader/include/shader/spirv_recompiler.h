@@ -59,6 +59,8 @@ struct Hints {
     // - when sampling, we need to know the component count of a texture
     SceGxmTextureFormat vertex_textures[SCE_GXM_MAX_TEXTURE_UNITS];
     SceGxmTextureFormat fragment_textures[SCE_GXM_MAX_TEXTURE_UNITS];
+
+    SceGxmOutputRegisterFormat output_register_format = SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED;
 };
 
 struct GeneratedShader {

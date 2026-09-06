@@ -277,7 +277,9 @@ bool USSETranslatorVisitor::vmov(
         result = source_1;
     }
 
+    m_store_is_raw_move = true;
     store(inst.opr.dest, result, dest_mask, dest_repeat_offset);
+    m_store_is_raw_move = false;
 
     END_REPEAT()
 

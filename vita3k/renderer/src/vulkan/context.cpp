@@ -43,6 +43,8 @@ void VKContext::wait_thread_function(const MemState &mem) {
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
     };
 
+    uint64_t pending_max_serial = 0;
+
     auto wait_for_fences = [&]() {
         const auto t0 = std::chrono::steady_clock::now();
         while (!fences.empty()) {
@@ -51,6 +53,7 @@ void VKContext::wait_thread_function(const MemState &mem) {
             if (result == vk::Result::eSuccess) {
                 // don't reset them
                 fences.clear();
+                state.completed_serial.store(pending_max_serial, std::memory_order_release); // seq-248
                 break;
             }
             if (result == vk::Result::eTimeout) {
@@ -73,10 +76,13 @@ void VKContext::wait_thread_function(const MemState &mem) {
 
         if (!wait_request)
             break;
+        state.wait_last_kind.store(static_cast<int>(wait_request->index()), std::memory_order_relaxed); // seq-249
+        state.wait_last_epoch_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
 
         std::visit(overloaded{
                        [&](FenceWaitRequest &request) {
                            fences.push_back(request.fence);
+                           pending_max_serial = std::max(pending_max_serial, request.serial); // seq-248
                        },
                        [&](NotificationRequest &request) {
                            if (request.notifications[0].address || request.notifications[1].address) {
@@ -156,6 +162,7 @@ void VKContext::wait_thread_function(const MemState &mem) {
                            }
                        } },
             *wait_request);
+        state.wait_fences_pending.store(static_cast<uint32_t>(fences.size()), std::memory_order_relaxed); // seq-249
     }
 }
 
@@ -631,10 +638,11 @@ void VKContext::stop_recording(const SceGxmNotification &notif1, const SceGxmNot
     state.general_queue.submit(submit_info, fence);
     cmdbuffers_to_submit.clear();
     state.frame().rendered_fences.push_back(fence);
+    state.submit_serial++; // seq-248
 
     if (state.features.enable_memory_mapping) {
         // send it to the wait queue
-        state.request_queue.push(FenceWaitRequest{ fence });
+        state.request_queue.push(FenceWaitRequest{ fence, state.submit_serial });
 
         if (state.mapping_method == MappingMethod::DoubleBuffer) {
             // sync all the visibility buffers

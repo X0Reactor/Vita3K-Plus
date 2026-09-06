@@ -21,6 +21,7 @@
 #include <renderer/types.h>
 
 #include <functional>
+#include <memory>
 #include <string>
 
 struct MemState;
@@ -38,7 +39,7 @@ struct State;
 struct VertexProgram;
 struct YUVConversionCache;
 
-bool create(std::unique_ptr<FragmentProgram> &fp, State &state, const SceGxmProgram &program, const SceGxmBlendInfo *blend, GXPPtrMap &gxp_ptr_map);
+bool create(std::unique_ptr<FragmentProgram> &fp, State &state, const SceGxmProgram &program, const SceGxmBlendInfo *blend, GXPPtrMap &gxp_ptr_map, SceGxmOutputRegisterFormat output_format = SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED, SceGxmMultisampleMode multisample_mode = SCE_GXM_MULTISAMPLE_NONE);
 bool create(std::unique_ptr<VertexProgram> &vp, State &state, const SceGxmProgram &program, GXPPtrMap &gxp_ptr_map, const std::vector<SceGxmVertexAttribute> &attributes);
 void create(SceGxmSyncObject *sync, State &state);
 void destroy(SceGxmSyncObject *sync, State &state, std::function<void()> dealloc = nullptr);
@@ -143,14 +144,15 @@ bool add_state_set_command(Context *ctx, const GXMState state, Args... arguments
 
 template <typename... Args>
 int send_single_command(State &state, Context *ctx, const CommandOpcode opcode, bool wait, Args... arguments) {
-    // Make a temporary command list
-    int status = CommandErrorCodePending; // Pending.
+    auto status = std::make_shared<int>(CommandErrorCodePending); // Pending.
     auto cmd = make_command(ctx ? ctx->alloc_func : generic_command_allocate, ctx ? ctx->free_func : generic_command_free,
-        opcode, wait ? &status : nullptr, arguments...);
+        opcode, wait ? status.get() : nullptr, arguments...);
 
     if (!cmd) {
         return CommandErrorArgumentsTooLarge;
     }
+    if (wait)
+        cmd->status_keepalive = status;
 
     CommandList list;
     list.first = cmd;
@@ -159,7 +161,7 @@ int send_single_command(State &state, Context *ctx, const CommandOpcode opcode, 
     // Submit it
     submit_command_list(state, ctx, list);
     if (wait)
-        return wait_for_status(state, &status, CommandErrorCodePending, false);
+        return wait_for_status(state, status.get(), CommandErrorCodePending, false);
     else
         return 0;
 }

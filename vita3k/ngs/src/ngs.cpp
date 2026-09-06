@@ -438,7 +438,7 @@ bool init_rack(State &ngs, const MemState &mem, System *system, SceNgsBufferInfo
 
     // Alloc spaces for voice
     rack->voices.resize(description->voice_count);
-    LOG_WARN("[NGSLIFE] init_rack {} ({} voices)", fmt::ptr(rack), description->voice_count);
+    LOG_DEBUG("[NGSLIFE] init_rack {} ({} voices)", fmt::ptr(rack), description->voice_count);
     rack->vdef = description->definition.get(mem);
 
     for (auto &voice : rack->voices) {
@@ -472,7 +472,7 @@ bool init_rack(State &ngs, const MemState &mem, System *system, SceNgsBufferInfo
 }
 
 void release_rack(State &ngs, const MemState &mem, System *system, Rack *rack) {
-    LOG_WARN("[NGSLIFE] release_rack {} ({} voices)", fmt::ptr(rack), rack ? rack->voices.size() : 0);
+    LOG_DEBUG("[NGSLIFE] release_rack {} ({} voices)", fmt::ptr(rack), rack ? rack->voices.size() : 0);
     // this function should only be called outside of ngs update and with the scheduler mutex acquired (except when releasing the system)
     if (!rack)
         return;

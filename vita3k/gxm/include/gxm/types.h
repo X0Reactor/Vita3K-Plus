@@ -1355,6 +1355,7 @@ enum SceGxmFragmentProgramInputs : int {
 enum SceGxmProgramFlags : uint32_t {
     SCE_GXM_PROGRAM_FLAG_FRAGMENT = 1 << 0,
     SCE_GXM_PROGRAM_FLAG_PER_INSTANCE_MODE = 1 << 1,
+    SCE_GXM_PROGRAM_FLAG_OUTPUT_IN_DECLARED_FORMAT = 1 << 2,
     SCE_GXM_PROGRAM_FLAG_DISCARD_USED = 1 << 3,
     SCE_GXM_PROGRAM_FLAG_DEPTH_USED = 1 << 4,
     SCE_GXM_PROGRAM_FLAG_SPRITECOORD_USED = 1 << 5,
@@ -1470,6 +1471,9 @@ struct SceGxmProgram {
     }
     bool is_native_color() const {
         return (program_flags & SCE_GXM_PROGRAM_FLAG_NATIVECOLOR_USED);
+    }
+    bool writes_output_in_declared_format() const {
+        return (program_flags & SCE_GXM_PROGRAM_FLAG_OUTPUT_IN_DECLARED_FORMAT);
     }
     bool is_frag_color_used() const {
         return (program_flags & SCE_GXM_PROGRAM_FLAG_FRAGCOLOR_USED);

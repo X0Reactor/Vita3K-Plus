@@ -103,6 +103,8 @@ struct VKState : public renderer::State {
 
     // only used when memory mapping is enabled
     std::map<Address, MappedMemory, std::greater<Address>> mapped_memories;
+    uint64_t submit_serial = 0;
+    std::atomic<uint64_t> completed_serial{ 0 };
 
 #ifdef __ANDROID__
     struct CachedNativeBuffer {

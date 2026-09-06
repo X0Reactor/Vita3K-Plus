@@ -171,7 +171,7 @@ bool EnvelopeModule::process(KernelState &kern, const MemState &mem, const SceUI
         if (logical->releasing) {
             const double rel_ms = std::max<double>(params->uReleaseMsecs, 0.0);
             if (logical->release_position_ms >= rel_ms) {
-                LOG_WARN("[NGSLIFE] ENVELOPE-RELEASE FINISH voice={} (release {}ms complete)", fmt::ptr(voice), rel_ms);
+                LOG_DEBUG("[NGSLIFE] ENVELOPE-RELEASE FINISH voice={} (release {}ms complete)", fmt::ptr(voice), rel_ms);
                 return true;
             }
         } else if (logical->current_point >= point_count - 1 && end_gain <= 0.0001f
@@ -188,7 +188,7 @@ bool EnvelopeModule::process(KernelState &kern, const MemState &mem, const SceUI
                 constexpr double ENVELOPE_COMPLETE_FINISH_GRACE_MS = 5000.0;
                 logical->completed_at_zero_ms += tick_ms;
                 if (logical->completed_at_zero_ms >= ENVELOPE_COMPLETE_FINISH_GRACE_MS) {
-                    LOG_ERROR("[NGSLIFE] ENVELOPE-COMPLETE FINISH voice={} ({} points, final=0, at zero {:.0f}ms) - abandoned fade, finishing voice",
+                    LOG_DEBUG("[NGSLIFE] ENVELOPE-COMPLETE FINISH voice={} ({} points, final=0, at zero {:.0f}ms) - abandoned fade, finishing voice",
                         fmt::ptr(voice), point_count, logical->completed_at_zero_ms);
                     return true;
                 }

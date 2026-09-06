@@ -690,7 +690,7 @@ EXPORT(SceInt32, sceNgsVoiceGetInfo, ngs::Voice *voice, SceNgsVoiceInfo *info) {
         auto [it, inserted] = last_answer.try_emplace(voice, ~0u);
         if (it->second != info->voice_state) {
             const bool stale = info->voice_state != 0 && voice->state == ngs::VoiceState::VOICE_STATE_AVAILABLE;
-            LOG_WARN("[NGSLIFE] GetInfo voice={} answer 0x{:X} (was 0x{:X}) hle_state={} pending={} paused={} keyed_off={}{}",
+            LOG_DEBUG("[NGSLIFE] GetInfo voice={} answer 0x{:X} (was 0x{:X}) hle_state={} pending={} paused={} keyed_off={}{}",
                 fmt::ptr(voice), info->voice_state, it->second == ~0u ? 0xFFFFFFFF : it->second,
                 static_cast<int>(voice->state), voice->is_pending ? 1 : 0, voice->is_paused ? 1 : 0, voice->is_keyed_off ? 1 : 0,
                 stale ? "  *** NONZERO WHILE SCHEDULER-AVAILABLE - THIS SLOT CAN NEVER BE RECLAIMED ***" : "");
@@ -803,7 +803,7 @@ EXPORT(SceInt32, sceNgsVoiceGetStateData, ngs::Voice *voice, const SceUInt32 mod
             if (it->second != head) {
                 it->second = head;
                 const float *f = static_cast<const float *>(mem);
-                LOG_WARN("[NGSSTATE] envelope state read voice={} height={:.4f} pos={:.1f} size={}", fmt::ptr(voice), f[0], f[1], mem_size);
+                LOG_DEBUG("[NGSSTATE] envelope state read voice={} height={:.4f} pos={:.1f} size={}", fmt::ptr(voice), f[0], f[1], mem_size);
             }
         }
     }
@@ -821,7 +821,7 @@ EXPORT(SceInt32, sceNgsVoiceInit, ngs::Voice *voice, const SceNgsVoicePreset *pr
         return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
 
     if (voice->state == ngs::VoiceState::VOICE_STATE_ACTIVE) {
-        LOG_ERROR("[NGSLIFE] VoiceInit REFUSED: voice={} is ACTIVE", fmt::ptr(voice));
+        LOG_WARN("[NGSLIFE] VoiceInit REFUSED: voice={} is ACTIVE", fmt::ptr(voice));
         return RET_ERROR(SCE_NGS_ERROR_INVALID_STATE);
     }
 
@@ -829,7 +829,7 @@ EXPORT(SceInt32, sceNgsVoiceInit, ngs::Voice *voice, const SceNgsVoicePreset *pr
 
     if (init_flags == SCE_NGS_VOICE_INIT_BASE || init_flags == SCE_NGS_VOICE_INIT_ALL) {
         if (voice->is_paused || voice->is_pending || voice->is_keyed_off)
-            LOG_ERROR("[NGSLIFE] VoiceInit voice={} clearing STALE flags (paused={} pending={} keyed_off={}) - these survived from before the re-init",
+            LOG_DEBUG("[NGSLIFE] VoiceInit voice={} clearing STALE flags (paused={} pending={} keyed_off={}) - these survived from before the re-init",
                 fmt::ptr(voice), voice->is_paused ? 1 : 0, voice->is_pending ? 1 : 0, voice->is_keyed_off ? 1 : 0);
         voice->state = ngs::VoiceState::VOICE_STATE_AVAILABLE;
         voice->is_paused = false;
@@ -999,7 +999,7 @@ EXPORT(int, sceNgsVoicePause, ngs::Voice *voice) {
         static std::atomic<uint64_t> n{ 0 };
         const uint64_t c = n.fetch_add(1, std::memory_order_relaxed) + 1;
         if (c <= 3 || (c % 1024) == 0)
-            LOG_WARN("[NGSLIFE] pause of ALREADY-PAUSED voice={} ({} so far) - returning OK (was INVALID_STATE)", fmt::ptr(voice), c);
+            LOG_DEBUG("[NGSLIFE] pause of ALREADY-PAUSED voice={} ({} so far) - returning OK (was INVALID_STATE)", fmt::ptr(voice), c);
         return SCE_NGS_OK;
     }
 
@@ -1045,7 +1045,7 @@ EXPORT(int, sceNgsVoiceResume, ngs::Voice *voice) {
         static std::atomic<uint64_t> n{ 0 };
         const uint64_t c = n.fetch_add(1, std::memory_order_relaxed) + 1;
         if (c <= 3 || (c % 4096) == 0)
-            LOG_WARN("[NGSLIFE] resume of NOT-PAUSED voice={} ({} so far) - returning OK (was INVALID_STATE)", fmt::ptr(voice), c);
+            LOG_DEBUG("[NGSLIFE] resume of NOT-PAUSED voice={} ({} so far) - returning OK (was INVALID_STATE)", fmt::ptr(voice), c);
         return SCE_NGS_OK;
     }
 

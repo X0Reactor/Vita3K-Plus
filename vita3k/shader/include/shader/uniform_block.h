@@ -41,6 +41,8 @@ struct RenderFragUniformBlock {
     float inv_frag_height = 1.0f;
     float raw_cast_mask = 0.0f;
     float iterator_written_mask = 16777215.0f;
+    // GXM colour write mask of the bound fragment program, R=1 G=2 B=4 A=8 (15 = all). The attachment
+    float color_write_mask = 15.0f;
 };
 
 enum FragUniformFieldId : uint32_t {
@@ -54,7 +56,8 @@ enum FragUniformFieldId : uint32_t {
     FRAG_UNIFORM_inv_frag_width,
     FRAG_UNIFORM_inv_frag_height,
     FRAG_UNIFORM_raw_cast_mask,
-    FRAG_UNIFORM_iterator_written_mask
+    FRAG_UNIFORM_iterator_written_mask,
+    FRAG_UNIFORM_color_write_mask
 };
 
 template <typename T>

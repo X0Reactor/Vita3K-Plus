@@ -34,6 +34,7 @@
 #include <util/align.h>
 
 #include <chrono>
+#include <future>
 #include <util/log.h>
 #include <util/tracy.h>
 
@@ -189,6 +190,30 @@ inline constexpr bool DORMANT_MAPPINGS = true;
 inline constexpr uint64_t DORMANT_BUDGET_BYTES = 128ull * 1024 * 1024;
 static std::atomic<uint32_t> g_dormant_count{ 0 };
 
+inline constexpr bool DORMANT_WAIT_PENDING_GPU_USE = true;
+
+static void wait_for_pending_gpu_use(renderer::State &renderer, vulkan::VKState &vk, Address address) {
+    auto ite = vk.mapped_memories.find(address);
+    if (ite == vk.mapped_memories.end())
+        return;
+    const uint64_t last_use = ite->second.last_gpu_use;
+    if (last_use == 0 || last_use <= vk.completed_serial.load(std::memory_order_acquire))
+        return;
+    // work still being recorded has no fence yet, the queued fences are all this can cover
+    renderer.in_dormant_wait.store(true, std::memory_order_relaxed);
+    if (DORMANT_WAIT_PENDING_GPU_USE) {
+        auto promise = std::make_shared<std::promise<void>>();
+        std::future<void> future = promise->get_future();
+        vk.request_queue.push(vulkan::CallbackRequest{
+            new vulkan::CallbackRequestFunction([promise]() { promise->set_value(); }), /* wait_for_gpu = */ true });
+        while (future.wait_for(std::chrono::milliseconds(5)) != std::future_status::ready) {
+            if (renderer.render_abort.load(std::memory_order_relaxed) || vk.request_queue.is_aborted())
+                break;
+        }
+    }
+    renderer.in_dormant_wait.store(false, std::memory_order_relaxed);
+}
+
 bool has_dormant_mappings() {
     return g_dormant_count.load(std::memory_order_acquire) != 0;
 }
@@ -282,7 +307,8 @@ COMMAND(handle_memory_unmap) {
             complete_command(renderer, helper, 0);
             return;
         }
-        // a live mapping goes dormant so no copy, no world-stop, no waitIdle
+        // a live mapping goes dormant so no copy, no world-stop, no waitIdle (the GPU must be done reading it first)
+        wait_for_pending_gpu_use(renderer, vk, addr.address());
         if (vk.make_dormant(addr.address())) {
             g_dormant_count.store(static_cast<uint32_t>(vk.dormant_mappings.size()), std::memory_order_release);
             evict_dormant_to_budget(renderer, mem, caller_thread, DORMANT_BUDGET_BYTES, "budget");
@@ -315,7 +341,7 @@ COMMAND(handle_memory_unmap_flush) {
 }
 
 // Client
-bool create(std::unique_ptr<FragmentProgram> &fp, State &state, const SceGxmProgram &program, const SceGxmBlendInfo *blend, GXPPtrMap &gxp_ptr_map) {
+bool create(std::unique_ptr<FragmentProgram> &fp, State &state, const SceGxmProgram &program, const SceGxmBlendInfo *blend, GXPPtrMap &gxp_ptr_map, SceGxmOutputRegisterFormat output_format, SceGxmMultisampleMode multisample_mode) {
     switch (state.current_backend) {
     case Backend::OpenGL:
         gl::create(fp, dynamic_cast<gl::GLState &>(state), program, blend);
@@ -328,6 +354,14 @@ bool create(std::unique_ptr<FragmentProgram> &fp, State &state, const SceGxmProg
     default:
         REPORT_MISSING(state.current_backend);
         return false;
+    }
+
+    fp->output_register_format = output_format;
+    fp->multisample_mode = multisample_mode;
+    fp->color_write_mask = 0xF;
+    if (blend) {
+        fp->color_write_mask = ((blend->colorMask & SCE_GXM_COLOR_MASK_R) ? 1 : 0) | ((blend->colorMask & SCE_GXM_COLOR_MASK_G) ? 2 : 0)
+            | ((blend->colorMask & SCE_GXM_COLOR_MASK_B) ? 4 : 0) | ((blend->colorMask & SCE_GXM_COLOR_MASK_A) ? 8 : 0);
     }
 
     // Try to hash this shader

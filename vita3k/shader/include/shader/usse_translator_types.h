@@ -66,6 +66,11 @@ struct SpirvShaderParameters {
     // for fragment: fragment outputs (color outputs)
     SpirvVarRegBank outs;
 
+    // Native-colour fragment programs created with a non-declared output register format only
+    // true for a typed float result
+    // false for a raw move or an integer store
+    spv::Id frag_output_holds_declared_type = 0;
+
     // Mapped to 'idx' (index) USSE registers
     // Use for indexing bank registers dynamically
     SpirvVarRegBank indexes;

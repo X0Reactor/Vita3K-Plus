@@ -121,6 +121,12 @@ struct State {
 
     std::atomic<uint64_t> progress_counter{ 0 };
     std::atomic<int64_t> last_mem_transition_epoch_ms{ 0 };
+    std::atomic<int> last_cmd_opcode{ -1 };
+    std::atomic<int64_t> last_cmd_epoch_ms{ 0 };
+    std::atomic<bool> in_dormant_wait{ false };
+    std::atomic<int> wait_last_kind{ -1 };
+    std::atomic<int64_t> wait_last_epoch_ms{ 0 };
+    std::atomic<uint32_t> wait_fences_pending{ 0 };
 
     bool should_display;
 

@@ -142,6 +142,8 @@ struct MappedMemory {
     vk::Buffer buffer;
     uint32_t size;
     uint64_t buffer_address;
+    uint32_t gpu_offset = 0;
+    uint64_t last_gpu_use = 0;
 };
 
 enum struct BufferType {
@@ -188,6 +190,7 @@ struct VisibilityBuffer {
 
 struct FenceWaitRequest {
     vk::Fence fence;
+    uint64_t serial = 0;
 };
 
 // request to trigger a notification after the previous fences have been waited for

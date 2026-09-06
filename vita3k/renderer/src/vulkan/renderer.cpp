@@ -1608,6 +1608,12 @@ void VKState::set_screen_filter(const std::string_view &filter) {
 // Flip this on only when hunting a LMK kill around a specific transition
 inline constexpr bool snapshot_on_memory_transition = false;
 
+// A mapped pointer that is not 4 KiB aligned means the GPU used to read this mapping from the wrong place
+static void note_page_table_skew(Address address, uint32_t size, uint32_t skew) {
+    if (skew)
+        LOG_INFO_ONCE("[PTSKEW] mapping 0x{:08X} size 0x{:X}: CPU pointer rounded up by 0x{:X} inside its vk::Buffer; get_matching_mapping compensates", address, size, skew);
+}
+
 bool VKState::map_memory_page_table_fallback(MemState &mem, Ptr<void> address, uint32_t size) {
     constexpr vk::BufferUsageFlags mapped_memory_flags = vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress | vk::BufferUsageFlagBits::eTransferDst;
     vkutil::Buffer buffer(size + KiB(4));
@@ -1630,6 +1636,8 @@ bool VKState::map_memory_page_table_fallback(MemState &mem, Ptr<void> address, u
 
     add_external_mapping(mem, address.address(), size, static_cast<uint8_t *>(buffer.mapped_data));
     mapped_memories[address.address()] = { address.address(), std::move(buffer), mapped_buffer, size, buffer_address };
+    mapped_memories[address.address()].gpu_offset = static_cast<uint32_t>(buffer_offset); // seq-251
+    note_page_table_skew(address.address(), size, static_cast<uint32_t>(buffer_offset));
     return true;
 }
 
@@ -1870,6 +1878,8 @@ bool VKState::map_memory(MemState &mem, Ptr<void> address, uint32_t size) {
 
         add_external_mapping(mem, address.address(), size, static_cast<uint8_t *>(buffer.mapped_data));
         mapped_memories[address.address()] = { address.address(), std::move(buffer), mapped_buffer, size, buffer_address };
+        mapped_memories[address.address()].gpu_offset = static_cast<uint32_t>(buffer_offset); // seq-251
+        note_page_table_skew(address.address(), size, static_cast<uint32_t>(buffer_offset));
         break;
     }
 
@@ -2139,7 +2149,8 @@ std::tuple<vk::Buffer, uint32_t> VKState::get_matching_mapping(const Ptr<void> a
         return { nullptr, 0 };
     }
 
-    return std::make_tuple(mapped_memory->second.buffer, address.address() - mapped_memory->first);
+    mapped_memory->second.last_gpu_use = submit_serial + 1;
+    return std::make_tuple(mapped_memory->second.buffer, address.address() - mapped_memory->first + mapped_memory->second.gpu_offset);
 }
 
 uint64_t VKState::get_matching_device_address(const Address address) {

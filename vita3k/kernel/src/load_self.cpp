@@ -145,7 +145,7 @@ static bool load_func_imports(const uint32_t *nids, const Ptr<uint32_t> *entries
             by_lib++;
         } else if (const auto nid_it = kernel.export_nids.find(nid); nid_it != kernel.export_nids.end()) {
             func_address = nid_it->second;
-            LOG_WARN("[LIBNID] import 0x{:08X} ({}) from lib '{}' (nid 0x{:08X}) bound by plain-NID FALLBACK to 0x{:X}",
+            LOG_DEBUG("[LIBNID] import 0x{:08X} ({}) from lib '{}' (nid 0x{:08X}) bound by plain-NID FALLBACK to 0x{:X}",
                 nid, import_name(nid), lib_name, library_nid, nid_it->second);
             fallback++;
         } else {
@@ -175,7 +175,7 @@ static bool load_func_imports(const uint32_t *nids, const Ptr<uint32_t> *entries
         }
     }
     if (count && (fallback || unbound))
-        LOG_WARN("[LIBNID] lib '{}' (nid 0x{:08X}): {} imports = {} by-lib, {} fallback, {} unbound(HLE)",
+        LOG_DEBUG("[LIBNID] lib '{}' (nid 0x{:08X}): {} imports = {} by-lib, {} fallback, {} unbound(HLE)",
             lib_name, library_nid, count, by_lib, fallback, unbound);
     return true;
 }

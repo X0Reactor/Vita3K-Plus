@@ -1420,7 +1420,7 @@ int condvar_wait(KernelState &kernel, MemState &mem, const char *export_name, Sc
         const int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         if (n <= 8 || holder || lock_res != SCE_KERNEL_OK || now_us - last_log_us.load(std::memory_order_relaxed) >= 60'000'000) {
             last_log_us.store(now_us, std::memory_order_relaxed);
-            LOG_WARN("[LWCOND] {}: timed wait on cond#{} '{}' by '{}' ({}) timed out; re-acquired mutex#{} (held by {} at the timeout, re-lock took {} us, result 0x{:X}) - timeout #{}",
+            LOG_DEBUG("[LWCOND] {}: timed wait on cond#{} '{}' by '{}' ({}) timed out; re-acquired mutex#{} (held by {} at the timeout, re-lock took {} us, result 0x{:X}) - timeout #{}",
                 export_name, condvar->uid, condvar->name, thread->name, thread_id, condvar->associated_mutex->uid,
                 holder ? fmt::format("'{}' ({})", holder->name, holder->id) : std::string("nobody"), relock_us, static_cast<uint32_t>(lock_res), n);
         }
@@ -1711,7 +1711,7 @@ int KernelState::try_break_provable_evf_cycle(bool dry_run) {
         }
         if (!all_setters_blocked_here)
             continue;
-        LOG_ERROR("[EVFCYCLE]{} flag {} '{}' looks PROVABLY dead: every historical setter is itself blocked on a flag with waiters - {} bits 0x{:X}",
+        LOG_WARN("[EVFCYCLE]{} flag {} '{}' looks PROVABLY dead: every historical setter is itself blocked on a flag with waiters - {} bits 0x{:X}",
             dry_run ? " (DRY-RUN)" : "", uid, fi.event->name, dry_run ? "would set" : "setting", fi.wanted_union);
         if (!dry_run)
             eventflag_set(*this, "provable_cycle_breaker", 0, uid, fi.wanted_union);
@@ -1823,7 +1823,7 @@ int KernelState::try_break_frame_sync_deadlock(std::vector<SceUID> &already_nudg
         }
     }
     for (const auto &[uid, bits] : nudges) {
-        LOG_ERROR("DEADLOCK BREAKER: event flag {} has blocked waiter(s) with no satisfiable condition; setting bits {:#x} to break a frame-sync deadlock (once per flag per stall)", uid, bits);
+        LOG_WARN("DEADLOCK BREAKER: event flag {} has blocked waiter(s) with no satisfiable condition; setting bits {:#x} to break a frame-sync deadlock (once per flag per stall)", uid, bits);
         already_nudged.push_back(uid);
         eventflag_set(*this, "deadlock_breaker", 0, uid, bits);
     }
