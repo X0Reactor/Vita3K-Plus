@@ -1439,12 +1439,23 @@ void destroy_all_render_targets(EmuEnvState &emuenv, const bool force_backend_de
 
 typedef std::uint32_t VertexCacheHash;
 
-static std::mutex g_live_programs_mutex;
-static std::unordered_set<Address> g_live_programs;
+enum class GxmProgramKind {
+    Vertex,
+    Fragment,
+};
 
-static void gxm_program_register(Address program) {
+static const char *gxm_program_kind_name(GxmProgramKind kind) {
+    return kind == GxmProgramKind::Vertex ? "vertex" : "fragment";
+}
+
+static std::mutex g_live_programs_mutex;
+// The guest allocator recycles a freed program's address, and a stale handle of the
+// other kind would otherwise pass the liveness gate and be reinterpreted as the wrong struct
+static std::unordered_map<Address, GxmProgramKind> g_live_programs;
+
+static void gxm_program_register(Address program, GxmProgramKind kind) {
     const std::lock_guard<std::mutex> lock(g_live_programs_mutex);
-    g_live_programs.insert(program);
+    g_live_programs[program] = kind;
 }
 
 static void gxm_program_unregister(Address program) {
@@ -1457,17 +1468,25 @@ static void gxm_program_registry_clear() {
     g_live_programs.clear();
 }
 
-// false (and a rate-limited warning) for a handle that was never created by the patcher or was already freed
-static bool gxm_program_is_live(Address program, const char *what) {
+// false (and a rate-limited warning) for a handle that was never created by the patcher, was already
+// freed, or whose address has since been recycled for a program of the other kind
+static bool gxm_program_is_live(Address program, GxmProgramKind kind, const char *what) {
+    const char *reason = nullptr;
     {
         const std::lock_guard<std::mutex> lock(g_live_programs_mutex);
-        if (g_live_programs.contains(program))
-            return true;
+        const auto live = g_live_programs.find(program);
+        if (live != g_live_programs.end()) {
+            if (live->second == kind)
+                return true;
+            reason = "its address now holds a program of the other kind";
+        } else {
+            reason = "freed or never created";
+        }
     }
     static std::atomic<uint32_t> stale{ 0 };
     const uint32_t n = stale.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n <= 8 || (n & 1023) == 0)
-        LOG_WARN("[PROGLIFE] {}: program 0x{:X} is not a live patcher program (freed or never created) - ignored (#{})", what, program, n);
+        LOG_WARN("[PROGLIFE] {}: program 0x{:X} is not a live {} program ({}) - ignored (#{})", what, program, gxm_program_kind_name(kind), reason, n);
     return false;
 }
 
@@ -1843,7 +1862,7 @@ static void gxmContextStateRestore(renderer::State &state, SceGxmContext *contex
         renderer::set_visibility_index(state, context->renderer.get(), false, 0, true);
     }
 
-    if (context->state.vertex_program && gxm_program_is_live(context->state.vertex_program.address(), "gxmContextStateRestore")) {
+    if (context->state.vertex_program && gxm_program_is_live(context->state.vertex_program.address(), GxmProgramKind::Vertex, "gxmContextStateRestore")) {
         const auto *program = context->state.vertex_program.get(mem);
         renderer::set_program(state, context->renderer.get(), context->state.vertex_program, program->renderer_binding, false);
 
@@ -1851,7 +1870,7 @@ static void gxmContextStateRestore(renderer::State &state, SceGxmContext *contex
     }
 
     // The uniform buffer, vertex stream will be uploaded later, for now only need to resync de textures
-    if (context->state.fragment_program && gxm_program_is_live(context->state.fragment_program.address(), "gxmContextStateRestore")) {
+    if (context->state.fragment_program && gxm_program_is_live(context->state.fragment_program.address(), GxmProgramKind::Fragment, "gxmContextStateRestore")) {
         const auto *program = context->state.fragment_program.get(mem);
         renderer::set_program(state, context->renderer.get(), context->state.fragment_program, program->renderer_binding, true);
 
@@ -2633,7 +2652,7 @@ static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, c
         ? pre_vert->program
         : context->state.vertex_program;
 
-    if (!gxm_program_is_live(frag_program_ptr.address(), export_name) || !gxm_program_is_live(vert_program_ptr.address(), export_name))
+    if (!gxm_program_is_live(frag_program_ptr.address(), GxmProgramKind::Fragment, export_name) || !gxm_program_is_live(vert_program_ptr.address(), GxmProgramKind::Vertex, export_name))
         return SCE_GXM_ERROR_NULL_PROGRAM;
 
     const SceGxmFragmentProgram &gxm_fragment_program = *frag_program_ptr.get(emuenv.mem);
@@ -2795,7 +2814,7 @@ EXPORT(int, sceGxmDrawPrecomputed, SceGxmContext *context, SceGxmPrecomputedDraw
     if (!vertex_program || !fragment_program) {
         return RET_ERROR(SCE_GXM_ERROR_NULL_PROGRAM);
     }
-    if (!gxm_program_is_live(fragment_program_gptr.address(), export_name) || !gxm_program_is_live(vertex_program_gptr.address(), export_name))
+    if (!gxm_program_is_live(fragment_program_gptr.address(), GxmProgramKind::Fragment, export_name) || !gxm_program_is_live(vertex_program_gptr.address(), GxmProgramKind::Vertex, export_name))
         return SCE_GXM_ERROR_NULL_PROGRAM;
 
     renderer::set_program(*emuenv.renderer, context->renderer.get(), fragment_program_gptr, fragment_program->renderer_binding, true);
@@ -4282,7 +4301,7 @@ EXPORT(int, sceGxmSetFragmentDefaultUniformBuffer, SceGxmContext *context, Ptr<c
 
 EXPORT(void, sceGxmSetFragmentProgram, SceGxmContext *context, Ptr<const SceGxmFragmentProgram> fragmentProgram) {
     TRACY_FUNC(sceGxmSetFragmentProgram, context, fragmentProgram);
-    if (!context || !fragmentProgram || !gxm_program_is_live(fragmentProgram.address(), export_name))
+    if (!context || !fragmentProgram || !gxm_program_is_live(fragmentProgram.address(), GxmProgramKind::Fragment, export_name))
         return;
 
     context->state.fragment_program = fragmentProgram;
@@ -4672,7 +4691,7 @@ EXPORT(int, sceGxmSetVertexDefaultUniformBuffer, SceGxmContext *context, Ptr<con
 
 EXPORT(void, sceGxmSetVertexProgram, SceGxmContext *context, Ptr<const SceGxmVertexProgram> vertexProgram) {
     TRACY_FUNC(sceGxmSetVertexProgram, context, vertexProgram);
-    if (!context || !vertexProgram || !gxm_program_is_live(vertexProgram.address(), export_name))
+    if (!context || !vertexProgram || !gxm_program_is_live(vertexProgram.address(), GxmProgramKind::Vertex, export_name))
         return;
 
     context->state.vertex_program = vertexProgram;
@@ -4949,8 +4968,6 @@ EXPORT(int, sceGxmShaderPatcherCreateFragmentProgram, SceGxmShaderPatcher *shade
     if (!*fragmentProgram) {
         return RET_ERROR(SCE_GXM_ERROR_OUT_OF_MEMORY);
     }
-    gxm_program_register(fragmentProgram->address());
-
     SceGxmFragmentProgram *const fp = fragmentProgram->get(mem);
     fp->is_maskupdate = false;
     fp->program = programId->program;
@@ -4973,6 +4990,7 @@ EXPORT(int, sceGxmShaderPatcherCreateFragmentProgram, SceGxmShaderPatcher *shade
     }
     fp->renderer_data = std::move(renderer_data);
     fp->renderer_binding = make_fragment_program_binding(*fp, mem);
+    gxm_program_register(fragmentProgram->address(), GxmProgramKind::Fragment);
 
     shaderPatcher->fragment_program_cache.emplace(key, *fragmentProgram);
 
@@ -4991,8 +5009,6 @@ EXPORT(int, sceGxmShaderPatcherCreateMaskUpdateFragmentProgram, SceGxmShaderPatc
     if (!*fragmentProgram) {
         return RET_ERROR(SCE_GXM_ERROR_OUT_OF_MEMORY);
     }
-    gxm_program_register(fragmentProgram->address());
-
     SceGxmFragmentProgram *const fp = fragmentProgram->get(mem);
     fp->is_maskupdate = true;
     fp->program = Ptr<const SceGxmProgram>(alloc_callbacked(emuenv, thread_id, shaderPatcher->params, size_mask_gxp));
@@ -5004,6 +5020,7 @@ EXPORT(int, sceGxmShaderPatcherCreateMaskUpdateFragmentProgram, SceGxmShaderPatc
     }
     fp->renderer_data = std::move(renderer_data);
     fp->renderer_binding = make_fragment_program_binding(*fp, mem);
+    gxm_program_register(fragmentProgram->address(), GxmProgramKind::Fragment);
 
     return 0;
 }
@@ -5040,8 +5057,6 @@ EXPORT(int, sceGxmShaderPatcherCreateVertexProgram, SceGxmShaderPatcher *shaderP
     if (!*vertexProgram) {
         return RET_ERROR(SCE_GXM_ERROR_OUT_OF_MEMORY);
     }
-    gxm_program_register(vertexProgram->address());
-
     SceGxmVertexProgram *const vp = vertexProgram->get(mem);
     vp->program = programId->program;
     vp->key_hash = key.hash;
@@ -5060,6 +5075,7 @@ EXPORT(int, sceGxmShaderPatcherCreateVertexProgram, SceGxmShaderPatcher *shaderP
     }
     vp->renderer_data = std::move(renderer_data);
     vp->renderer_binding = make_vertex_program_binding(*vp, mem);
+    gxm_program_register(vertexProgram->address(), GxmProgramKind::Vertex);
 
     shaderPatcher->vertex_program_cache.emplace(key, *vertexProgram);
 

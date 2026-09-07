@@ -29,6 +29,8 @@
 #include <renderer/vulkan/state.h>
 #include <renderer/vulkan/types.h>
 
+#include <atomic>
+
 #include <util/align.h>
 #include <util/log.h>
 #include <util/tracy.h>
@@ -91,6 +93,20 @@ COMMAND_SET_STATE(program) {
     // their payload is released only when the deferred command list is destroyed.
     if (!(helper.cmd->flags & Command::FLAG_NO_FREE))
         delete binding_payload;
+
+    // A binding only ever carries the program of its own kind, so a mismatch means the guest handle this
+    // command was built from no longer describes the program the binding was made for.
+    if (is_fragment ? !binding->fragment_program : !binding->vertex_program) {
+        static std::atomic<uint32_t> mismatched{ 0 };
+        const uint32_t n = mismatched.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n & 1023) == 0)
+            LOG_ERROR("[PROGMIX] SetProgram({}) got a binding without a {} program: handle 0x{:X} binding {} vert={} frag={} gxp={} streams={} attrs={} key_hash=0x{:X} maskupdate={} deferred={} - ignored (#{})",
+                is_fragment ? "fragment" : "vertex", is_fragment ? "fragment" : "vertex", program.address(),
+                fmt::ptr(binding.get()), static_cast<bool>(binding->vertex_program), static_cast<bool>(binding->fragment_program),
+                binding->gxp.size(), binding->streams.size(), binding->attributes.size(), binding->key_hash,
+                binding->is_maskupdate, static_cast<bool>(helper.cmd->flags & Command::FLAG_NO_FREE), n);
+        return;
+    }
 
     if (is_fragment) {
         render_context->record.fragment_program = program.cast<SceGxmFragmentProgram>();
