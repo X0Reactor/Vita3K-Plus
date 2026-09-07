@@ -1071,18 +1071,17 @@ SceUID create_overlay(IOState &io, SceFiosProcessOverlay *fios_overlay) {
     return res;
 }
 
-std::string resolve_path(IOState &io, const char *input, const SceUInt32 min_order, const SceUInt32 max_order) {
+std::string resolve_path(IOState &io, const char *input, const fs::path &vita_fs_path, const SceUInt32 min_order, const SceUInt32 max_order) {
     std::lock_guard<std::mutex> lock(io.overlay_mutex);
 
-    std::string curr_path = input;
+    const std::string curr_path = input;
 
     size_t overlay_idx = 0;
     while (overlay_idx < io.overlays.size() && io.overlays[overlay_idx].order < min_order)
         overlay_idx++;
 
-    while (overlay_idx < io.overlays.size()) {
+    for (; overlay_idx < io.overlays.size(); overlay_idx++) {
         const FiosOverlay &overlay = io.overlays[overlay_idx];
-        overlay_idx++;
 
         if (overlay.order > max_order)
             break;
@@ -1090,8 +1089,18 @@ std::string resolve_path(IOState &io, const char *input, const SceUInt32 min_ord
         if (!curr_path.starts_with(overlay.dst))
             continue;
 
-        // replace dst with src
-        curr_path = overlay.src + curr_path.substr(overlay.dst.size());
+        const std::string candidate = overlay.src + curr_path.substr(overlay.dst.size());
+
+        if (overlay.type == SCE_FIOS_OVERLAY_TYPE_OPAQUE)
+            return candidate;
+
+        VitaIoDevice candidate_device = device::get_device(candidate.c_str());
+        if (candidate_device == VitaIoDevice::_INVALID)
+            continue;
+
+        const fs::path host_path = expand_path(io, candidate.c_str(), vita_fs_path);
+        if (fs::exists(host_path))
+            return candidate;
     }
 
     return curr_path;

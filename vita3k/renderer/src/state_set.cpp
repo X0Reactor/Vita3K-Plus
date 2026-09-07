@@ -94,8 +94,7 @@ COMMAND_SET_STATE(program) {
     if (!(helper.cmd->flags & Command::FLAG_NO_FREE))
         delete binding_payload;
 
-    // A binding only ever carries the program of its own kind, so a mismatch means the guest handle this
-    // command was built from no longer describes the program the binding was made for.
+    // A binding only carries the program of its own kind, so a mismatch means the handle no longer describes it
     if (is_fragment ? !binding->fragment_program : !binding->vertex_program) {
         static std::atomic<uint32_t> mismatched{ 0 };
         const uint32_t n = mismatched.fetch_add(1, std::memory_order_relaxed) + 1;

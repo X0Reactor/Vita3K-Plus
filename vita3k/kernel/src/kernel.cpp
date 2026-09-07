@@ -448,6 +448,9 @@ void KernelState::log_thread_hang_dump() {
     if (hang_file)
         hang_file << "==== " << std::put_time(std::localtime(&now), "%Y-%m-%d %H:%M:%S") << " ====\n"
                   << dump << std::endl;
+
+    // a condvar hang looks identical whether the game never produced or we delivered a wake to nobody
+    log_condvar_history();
 }
 
 void KernelState::resume_world() {

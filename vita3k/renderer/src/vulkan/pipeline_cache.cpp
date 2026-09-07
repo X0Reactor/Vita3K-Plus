@@ -494,9 +494,18 @@ static const vk::SpecializationInfo srgb_info_false = {
     .pData = &srgb_entry_false
 };
 
-vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmProgram *program, const Sha256Hash &hash, bool is_vertex, bool maskupdate, MemState &mem, const shader::Hints &hints, bool is_srgb) {
+vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmProgram *program, const Sha256Hash &base_hash, bool is_vertex, bool maskupdate, MemState &mem, const shader::Hints &hints, bool is_srgb) {
     if (maskupdate)
         LOG_WARN_ONCE("Mask not implemented in the vulkan renderer!");
+
+    // A one-channel surface moves a different component into the stored channel, so it needs its own cache entry
+    const int one_channel_source = is_vertex ? -1 : gxm::one_channel_source_component(hints.color_format);
+    Sha256Hash hash = base_hash;
+    std::string version_suffix;
+    if (one_channel_source > 0) {
+        hash[0] ^= static_cast<uint8_t>(0xC0 + one_channel_source);
+        version_suffix = fmt::format("c{}", one_channel_source);
+    }
 
     const vk::ShaderModule shader_compiling = std::bit_cast<vk::ShaderModule>(~0ULL);
 
@@ -543,7 +552,7 @@ vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmPro
     const std::string hash_text = hex_string(hash);
 
     LOG_INFO("Generating vulkan spv shader {}", hash_text);
-    const std::string shader_version = fmt::format("vk{}", shader::CURRENT_VERSION);
+    const std::string shader_version = fmt::format("vk{}{}", shader::CURRENT_VERSION, version_suffix);
 
     shader::usse::SpirvCode source = load_spirv_shader(*program, state.features, true, hints, maskupdate, state.shaders_path, state.shaders_log_path, shader_version, true);
 

@@ -158,7 +158,7 @@ void sync_texture(VKContext &context, MemState &mem, std::size_t index, SceGxmTe
     }
 
     if (lookup_result.has_value()) {
-        const bool needs_nearest = !context.state.texture_cache.format_supports_linear_filter(lookup_result->format);
+        const bool needs_nearest = lookup_result->is_raw_bits || !context.state.texture_cache.format_supports_linear_filter(lookup_result->format);
         context.state.texture_cache.cache_and_bind_sampler(texture, needs_nearest);
     } else {
         context.state.texture_cache.current_scene = context.scene_timestamp;

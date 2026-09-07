@@ -107,6 +107,9 @@ struct Command {
     CommandOpcode opcode;
     std::uint8_t flags = 0;
 
+    std::uint32_t magic = 0;
+    static constexpr std::uint32_t MAGIC_LIVE = 0xC0DEC0DEu;
+
     std::uint8_t data[MAX_COMMAND_DATA_SIZE];
     int *status;
     std::shared_ptr<int> status_keepalive;
@@ -181,6 +184,7 @@ Command *make_command(CommandAllocFunc alloc_func, CommandFreeFunc free_func, co
     Command *new_command = alloc_func();
 
     new_command->opcode = opcode;
+    new_command->magic = Command::MAGIC_LIVE;
     new_command->status = status;
     new_command->next = nullptr;
 

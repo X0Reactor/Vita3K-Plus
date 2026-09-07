@@ -32,6 +32,7 @@
 #include <overlay/shader_precompile_progress.h>
 #include <util/log.h>
 
+#include <atomic>
 #include <memory>
 #include <thread>
 
@@ -120,6 +121,15 @@ static void process_batch(renderer::State &state, const FeatureState &features, 
             return table;
         }();
 
+        if (cmd->magic != Command::MAGIC_LIVE) {
+            static std::atomic<uint32_t> stale{ 0 };
+            const uint32_t n = stale.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 8 || (n & 1023) == 0)
+                LOG_ERROR("[CMDSTALE] command {} has magic 0x{:X} (opcode {}, flags 0x{:X}) - abandoning the rest of this list (#{})",
+                    fmt::ptr(cmd), cmd->magic, static_cast<int>(cmd->opcode), cmd->flags, n);
+            break;
+        }
+
         const size_t op_index = static_cast<size_t>(cmd->opcode);
         CommandHandlerFunc *handler_fn = op_index < handler_table.size() ? handler_table[op_index] : nullptr;
         if (!handler_fn) {
@@ -135,6 +145,9 @@ static void process_batch(renderer::State &state, const FeatureState &features, 
 
         Command *last_cmd = cmd;
         cmd = cmd->next;
+
+        if (!(last_cmd->flags & Command::FLAG_NO_FREE))
+            last_cmd->magic = 0;
 
         if (command_list.context) {
             command_list.context->free_func(last_cmd);

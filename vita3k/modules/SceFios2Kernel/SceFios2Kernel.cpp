@@ -157,7 +157,7 @@ EXPORT(int, _sceFiosKernelOverlayResolveSync, SceUID pid, int resolveFlag, const
     if (!pInPath || !pOutPath)
         return RET_ERROR(SCE_FIOS_ERROR_BAD_PTR);
 
-    const std::string resolved = resolve_path(emuenv.io, pInPath);
+    const std::string resolved = resolve_path(emuenv.io, pInPath, emuenv.vita_fs_path);
     strncpy(pOutPath.get(emuenv.mem), resolved.c_str(), maxPath);
     return SCE_FIOS_OK;
 }
@@ -169,7 +169,7 @@ EXPORT(int, _sceFiosKernelOverlayResolveWithRangeSync, SceUID pid, int resolveFl
 
     const SceUInt32 min_order = static_cast<uint8_t>(opt->loOrderFilter);
     const SceUInt32 max_order = (opt->hiOrderFilter == 0 && opt->loOrderFilter == 0) ? 0x7F : static_cast<uint8_t>(opt->hiOrderFilter);
-    const std::string resolved = resolve_path(emuenv.io, pInPath, min_order, max_order);
+    const std::string resolved = resolve_path(emuenv.io, pInPath, emuenv.vita_fs_path, min_order, max_order);
     strncpy(opt->pOutPath.get(emuenv.mem), resolved.c_str(), opt->maxPath);
     return SCE_FIOS_OK;
 }

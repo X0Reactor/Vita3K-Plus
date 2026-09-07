@@ -1081,10 +1081,12 @@ struct SceGxmContext {
         while (cmd != command_list->list->last) {
             renderer::Command *next = cmd->next;
             renderer::destroy_command_payload(*cmd);
+            cmd->~Command();
             free(cmd);
             cmd = next;
         }
         renderer::destroy_command_payload(*cmd);
+        cmd->~Command();
         free(cmd);
         free(command_list->list);
 
@@ -1234,6 +1236,7 @@ struct SceGxmContext {
             if (cmd->flags & renderer::Command::FLAG_FROM_HOST) {
                 delete cmd;
             } else {
+                cmd->~Command();
                 command_last_free_pos.fetch_add(1, std::memory_order_release);
             }
         }
@@ -1261,6 +1264,7 @@ static void destroy_pending_deferred_command_chain(renderer::CommandList &comman
     while (cmd) {
         renderer::Command *next = cmd->next;
         renderer::destroy_command_payload(*cmd);
+        cmd->~Command();
         free(cmd);
         cmd = next;
     }
@@ -1449,8 +1453,7 @@ static const char *gxm_program_kind_name(GxmProgramKind kind) {
 }
 
 static std::mutex g_live_programs_mutex;
-// The guest allocator recycles a freed program's address, and a stale handle of the
-// other kind would otherwise pass the liveness gate and be reinterpreted as the wrong struct
+// The guest allocator recycles a freed program's address, so a stale handle of the other kind would pass the gate
 static std::unordered_map<Address, GxmProgramKind> g_live_programs;
 
 static void gxm_program_register(Address program, GxmProgramKind kind) {

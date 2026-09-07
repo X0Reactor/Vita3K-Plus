@@ -31,6 +31,7 @@ namespace gxm {
 SceGxmColorBaseFormat get_base_format(SceGxmColorFormat src);
 size_t bits_per_pixel(SceGxmColorBaseFormat base_format);
 size_t get_stride_in_bytes(const SceGxmColorFormat src, const std::size_t stride_in_pixels);
+int one_channel_source_component(SceGxmColorFormat src);
 
 // Textures.
 uint32_t get_width(const SceGxmTexture &texture);

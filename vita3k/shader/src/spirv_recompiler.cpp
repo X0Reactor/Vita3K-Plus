@@ -1737,6 +1737,13 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
         color = b.createTriOp(spv::OpSelect, b.getTypeId(color), holds_declared4, declared_color, color);
     }
 
+    const int one_channel_source = gxm::one_channel_source_component(translate_state.hints->color_format);
+    if (one_channel_source > 0) {
+        const spv::Id f32 = b.makeFloatType(32);
+        const spv::Id chan = b.createCompositeExtract(color, f32, static_cast<unsigned>(one_channel_source));
+        color = b.createCompositeConstruct(b.makeVectorType(f32, 4), { chan, chan, chan, chan });
+    }
+
     if (program.is_frag_color_used() && features.should_use_shader_interlock()) {
         spv::Id signed_i32 = b.makeIntType(32);
         spv::Id coord_id = b.createLoad(translate_state.frag_coord_id, spv::NoPrecision);
@@ -1916,8 +1923,7 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
     o_op.num = 0;
     o_op.swizzle = SWIZZLE_CHANNEL_4_DEFAULT;
 
-    // gl_ClipDistance carries the two eye-plane guards first, then whatever clip planes the program declares
-    // the guards are derived from the position output, so without one there is nothing to guard
+    // gl_ClipDistance carries the two eye-plane guards first, then the planes the program declares
     const bool emit_eye_clip = translation_state.is_vulkan && features.support_clip_distance && (vertex_outputs & SCE_GXM_VERTEX_PROGRAM_OUTPUT_POSITION);
     const uint32_t eye_clip_count = emit_eye_clip ? 2 : 0;
     uint32_t gxm_clip_count = 0;
@@ -1943,9 +1949,6 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
         translation_state.interfaces.push_back(clip_var);
     }
     uint32_t gxm_clip_written = 0;
-    if (gxm_clip_count > 0)
-        LOG_INFO("[CLIPPLANE] vertex program {} declares {} clip plane(s), written to gl_ClipDistance[{}..{}]",
-            translation_state.hash, gxm_clip_count, eye_clip_count, eye_clip_count + gxm_clip_count - 1);
 
     for (const auto vo : vertex_outputs_list) {
         if (vertex_outputs & vo) {
@@ -2559,6 +2562,20 @@ void convert_gxp_to_glsl_from_filepath(const std::string &shader_filepath_utf8) 
             if (variant_file) {
                 variant_file.write(reinterpret_cast<const char *>(variant.spirv.data()), static_cast<std::streamsize>(variant.spirv.size() * sizeof(uint32_t)));
                 LOG_INFO("Wrote the {} output-register variant to {} ({} words)", output_register_format_name(format), variant_path.string(), variant.spirv.size());
+            }
+        }
+
+        // The A8 surface variant so the one-channel output path can be validated offline too
+        Hints a8_hints = hints;
+        a8_hints.color_format = SCE_GXM_COLOR_FORMAT_U8_A;
+        const GeneratedShader a8 = convert_gxp(gxp, shader_filepath_str.filename().string(), vk_features, shader::Target::SpirVVulkan, a8_hints, false, false);
+        if (!a8.spirv.empty()) {
+            fs::path a8_path = shader_filepath_str;
+            a8_path.replace_extension(".vk.a8.spv");
+            fs::ofstream a8_file(a8_path, std::ios::binary);
+            if (a8_file) {
+                a8_file.write(reinterpret_cast<const char *>(a8.spirv.data()), static_cast<std::streamsize>(a8.spirv.size() * sizeof(uint32_t)));
+                LOG_INFO("Wrote the U8_A one-channel-surface variant to {} ({} words)", a8_path.string(), a8.spirv.size());
             }
         }
     }

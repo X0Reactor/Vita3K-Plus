@@ -103,6 +103,25 @@ void evf_record(SceUID evf, SceUID thread, uint8_t op, uint32_t bits, uint32_t f
     evf_ring[idx % EVF_RING_SIZE] = EvfOp{ ms, evf, thread, op, bits, flags_after, woken };
 }
 
+// A condvar hang is either the game never producing or a signal we delivered to nobody
+struct CondOp {
+    uint64_t ms;
+    SceUID cond;
+    SceUID thread;
+    uint8_t op; // 0=WAIT_BLOCK 1=WAIT_DONE 2=SIGNAL 3=SIGNAL_UNDELIVERED
+    uint32_t waiters;
+    int32_t result;
+};
+constexpr size_t COND_RING_SIZE = 512;
+std::array<CondOp, COND_RING_SIZE> cond_ring{};
+std::atomic<uint64_t> cond_ring_next{ 0 };
+
+void cond_record(SceUID cond, SceUID thread, uint8_t op, uint32_t waiters, int32_t result) {
+    const uint64_t idx = cond_ring_next.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    cond_ring[idx % COND_RING_SIZE] = CondOp{ ms, cond, thread, op, waiters, result };
+}
+
 struct MutexCacheEntry {
     SceUID uid = 0;
     SyncWeight weight = SyncWeight::Light;
@@ -1395,9 +1414,11 @@ int condvar_wait(KernelState &kernel, MemState &mem, const char *export_name, Sc
 
     const auto data_it = condvar->waiting_threads->push(data);
     thread_lock.unlock();
+    cond_record(condvar->uid, thread_id, 0, static_cast<uint32_t>(condvar->waiting_threads->size()), 0);
 
     const int wait_res = handle_timeout(kernel, thread, thread_lock, condition_variable_lock, condvar->waiting_threads, data_it, export_name, timeout);
     condition_variable_lock.unlock();
+    cond_record(condvar->uid, thread_id, 1, static_cast<uint32_t>(condvar->waiting_threads->size()), wait_res);
 
     // The kernel hands the associated mutex back to the waiter before returning no matter how the wait
     // ended, and Sony's own libraries depend on that: the Fios scheduler records itself as the owner of
@@ -1459,17 +1480,22 @@ int condvar_signal(KernelState &kernel, const char *export_name, SceUID thread_i
             waiting_threads->erase(waiting_thread_iter);
         } else {
             // Returning ok here silently dropped the wake
+            cond_record(condid, thread_id, 3, 0, 0);
             LOG_ERROR("[SYNCLOST] {}: SignalCondTo target '{}' (tid {}) is NOT waiting on cv {} - signal undeliverable, returning error", export_name, waiting_thread ? waiting_thread->name : "?", signal_target.thread_id, condid);
             return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
         }
+        cond_record(condid, thread_id, 2, 1, 0);
     } else {
+        uint32_t woken = 0;
         while (!waiting_threads->empty()) {
             const auto waiting_thread_data = *waiting_threads->begin();
             auto waiting_thread = waiting_thread_data.thread;
             const std::lock_guard<std::mutex> waiting_thread_lock(waiting_thread->mutex);
             waiting_thread->update_status(ThreadStatus::run, ThreadStatus::wait);
             waiting_threads->pop();
+            woken++;
         }
+        cond_record(condid, thread_id, woken ? 2 : 3, woken, 0);
     }
 
     return SCE_KERNEL_OK;
@@ -1743,6 +1769,22 @@ void KernelState::log_eventflag_history() {
             op_names[e.op <= 4 ? e.op : 4], e.ms, e.evf, e.thread, e.bits, e.flags_after, e.woken);
     }
     LOG_ERROR("HANG EVF HISTORY ({} op(s), oldest first):\n{}", count, hist);
+}
+
+void KernelState::log_condvar_history() {
+    const uint64_t next = cond_ring_next.load(std::memory_order_relaxed);
+    const uint64_t count = std::min<uint64_t>(next, COND_RING_SIZE);
+    static const char *op_names[] = { "WAIT_BLOCK", "WAIT_DONE", "SIGNAL", "SIGNAL_TO_NOBODY" };
+    std::string hist;
+    uint32_t undelivered = 0;
+    for (uint64_t k = next - count; k < next; k++) {
+        const CondOp &c = cond_ring[k % COND_RING_SIZE];
+        if (c.op == 3)
+            undelivered++;
+        hist += fmt::format("{} ms={} cond={} tid={} waiters={} res=0x{:X}\n",
+            op_names[c.op <= 3 ? c.op : 3], c.ms, c.cond, c.thread, c.waiters, static_cast<uint32_t>(c.result));
+    }
+    LOG_ERROR("HANG COND HISTORY ({} op(s), {} delivered to nobody, oldest first):\n{}", count, undelivered, hist);
 }
 
 int KernelState::nudge_all_condvar_waiters() {
