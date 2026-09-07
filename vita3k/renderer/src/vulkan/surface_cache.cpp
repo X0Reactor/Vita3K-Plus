@@ -915,10 +915,12 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
     const bool store_is_f16_format = info.format == SCE_GXM_COLOR_BASE_FORMAT_F16
         || info.format == SCE_GXM_COLOR_BASE_FORMAT_F16F16
         || info.format == SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16;
+    // An F32F32 store loses NaN words the same way even on a same-format read
+    const bool store_is_f32f32 = info.format == SCE_GXM_COLOR_BASE_FORMAT_F32F32;
     constexpr bool carry_raw_cast_in_unorm = true;
     const bool raw_bits_cast = carry_raw_cast_in_unorm && !is_typeless_cast
-        && bytes_per_pixel_in_store == 8 && store_is_f16_format
-        && vk_format != info.texture.format;
+        && bytes_per_pixel_in_store == 8 && (store_is_f16_format || store_is_f32f32)
+        && (vk_format != info.texture.format || store_is_f32f32);
 
     // TODO: this is true only for linear textures (and also kind of for tiled textures) (and in this case start_x = 0),
     // for swizzled textures this is different
@@ -956,7 +958,7 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
     const vk::ImageView color_handle_view = reinterpret_cast<VKContext *>(state.context)->current_color_view;
     const bool is_same_image = (color_handle_view == info.texture.view) || (color_handle_view == info.alternate_view);
 
-    if (state.features.use_texture_viewport && base_format == info.format) {
+    if (state.features.use_texture_viewport && base_format == info.format && !raw_bits_cast) {
         // use a texture viewport
         *texture_viewport = {
             .ratio = {
@@ -1004,7 +1006,7 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
         && texture.min_filter == SCE_GXM_TEXTURE_FILTER_POINT
         && texture.mag_filter == SCE_GXM_TEXTURE_FILTER_POINT;
 
-    if (is_same_image || (start_sourced_line != 0) || (start_x != 0) || (info.width != width) || (info.height != height) || (info.format != base_format) || non_integer_downsample) {
+    if (is_same_image || (start_sourced_line != 0) || (start_x != 0) || (info.width != width) || (info.height != height) || (info.format != base_format) || non_integer_downsample || raw_bits_cast) {
         const uint64_t scene_timestamp = reinterpret_cast<VKContext *>(state.context)->scene_timestamp;
 
         std::vector<CastedTexture> &casted_vec = info.casted_textures;
@@ -1088,7 +1090,7 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
             if (raw_bits_cast) {
                 // carry the bytes in a NaN-free format; the shader rebuilds the words after sampling
                 casted->texture.format = vk::Format::eR16G16B16A16Unorm;
-                LOG_INFO_ONCE("Raw-bit cast of a 64-bit F16 store: carrying the bytes through a UNORM image");
+                LOG_INFO_ONCE("[RAWCAST] 64-bit {} store read for its bytes: carried through a UNORM image so NaN words survive", store_is_f32f32 ? "F32F32" : "F16");
             }
 
             const bool casted_is_rgba8 = casted->texture.format == vk::Format::eR8G8B8A8Srgb

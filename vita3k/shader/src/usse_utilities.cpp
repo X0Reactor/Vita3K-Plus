@@ -1661,6 +1661,44 @@ spv::Id convert_to_int(spv::Builder &b, const SpirvUtilFunctions &utils, spv::Id
         opr = b.createBuiltinCall(opr_type, utils.std_builtins, GLSLstd450FClamp, { opr, range_begin_vec, range_end_vec });
         opr = b.createBinOp(spv::OpFMul, opr_type, opr, normalizer_vec);
         opr = b.createBuiltinCall(opr_type, utils.std_builtins, GLSLstd450Round, { opr });
+    } else {
+        // A result above 255 used to wrap through the 8-bit field
+        float lo = 0.0f, hi = 0.0f;
+        switch (type) {
+        case DataType::UINT8:
+            lo = 0.0f;
+            hi = 255.0f;
+            break;
+        case DataType::INT8:
+            lo = -128.0f;
+            hi = 127.0f;
+            break;
+        case DataType::UINT16:
+            lo = 0.0f;
+            hi = 65535.0f;
+            break;
+        case DataType::INT16:
+            lo = -32768.0f;
+            hi = 32767.0f;
+            break;
+        case DataType::UINT32:
+            lo = 0.0f;
+            hi = 4294967295.0f;
+            break;
+        case DataType::INT32:
+            lo = -2147483648.0f;
+            hi = 2147483647.0f;
+            break;
+        default: break;
+        }
+        if (lo != hi) {
+            const spv::Id lo_vec = create_constant_vector_or_scalar(b, b.makeFloatConstant(lo), comp_count);
+            const spv::Id hi_vec = create_constant_vector_or_scalar(b, b.makeFloatConstant(hi), comp_count);
+            const spv::Id bool_type = (comp_count > 1) ? b.makeVectorType(b.makeBoolType(), comp_count) : b.makeBoolType();
+            const spv::Id is_nan = b.createUnaryOp(spv::OpIsNan, bool_type, opr);
+            opr = b.createBuiltinCall(opr_type, utils.std_builtins, GLSLstd450FClamp, { opr, lo_vec, hi_vec });
+            opr = b.createTriOp(spv::OpSelect, opr_type, is_nan, create_constant_vector_or_scalar(b, b.makeFloatConstant(0.0f), comp_count), opr);
+        }
     }
 
     if (!is_uint) {
