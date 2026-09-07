@@ -127,6 +127,7 @@ struct Mutex : SyncPrimitive {
     int init_count;
     int lock_count;
     ThreadStatePtr owner;
+    SceUID owner_id = 0;
     WaitingThreadQueuePtr waiting_threads;
     Ptr<SceKernelLwMutexWork> workarea;
     std::atomic<bool> deleted{ false };

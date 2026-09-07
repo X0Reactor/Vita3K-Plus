@@ -667,11 +667,13 @@ SceUID mutex_create(SceUID *uid_out, KernelState &kernel, MemState &mem, const c
     strncpy(mutex->name, mutex_name, KERNELOBJECT_MAX_NAME_LENGTH);
     mutex->attr = attr;
     mutex->owner = nullptr;
+    mutex->owner_id = 0;
     if (init_count > 0) {
         const ThreadStatePtr thread = kernel.get_thread(thread_id);
         if (!thread) // the thread is being torn down so fail its last import instead of crashing the process
             return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
         mutex->owner = thread;
+        mutex->owner_id = thread_id;
     }
     if (mutex->attr & SCE_KERNEL_ATTR_TH_PRIO) {
         mutex->waiting_threads = std::make_unique<PriorityThreadDataQueue<WaitingThreadData>>();
@@ -729,19 +731,16 @@ inline static int mutex_lock_impl(KernelState &kernel, MemState &mem, const char
             mutex->waiting_threads->size());
     }
 
-    const ThreadStatePtr thread = kernel.get_thread(thread_id);
-    if (!thread) // the thread is being torn down so fail its last import instead of crashing the process
-        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
-
+    // The thread handle and the wait bookkeeping are only needed once a thread has to block or take
+    // ownership and this is the hottest call in the emulator
     std::unique_lock<std::mutex> mutex_lock(mutex->mutex);
-    thread->set_wait_reason("mutex", mutex->uid, mutex->owner ? mutex->owner->id : 0);
 
-    bool is_recursive = (mutex->attr & SCE_KERNEL_MUTEX_ATTR_RECURSIVE);
+    const bool is_recursive = (mutex->attr & SCE_KERNEL_MUTEX_ATTR_RECURSIVE);
 
     // Already owned
     if (mutex->lock_count > 0) {
         // Owned by ourselves
-        if (mutex->owner == thread) {
+        if (mutex->owner_id == thread_id) {
             if (is_recursive) {
                 mutex->lock_count += lock_count;
                 if (weight == SyncWeight::Light)
@@ -765,6 +764,11 @@ inline static int mutex_lock_impl(KernelState &kernel, MemState &mem, const char
         }
 
         // Sleep thread!
+        const ThreadStatePtr thread = kernel.get_thread(thread_id);
+        if (!thread) // the thread is being torn down so fail its last import instead of crashing the process
+            return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+        thread->set_wait_reason("mutex", mutex->uid, mutex->owner_id);
+
         std::unique_lock<std::mutex> thread_lock(thread->mutex);
         thread->update_status(ThreadStatus::wait, ThreadStatus::run);
 
@@ -780,7 +784,7 @@ inline static int mutex_lock_impl(KernelState &kernel, MemState &mem, const char
         while (true) {
             res = handle_timeout(kernel, thread, thread_lock, mutex_lock, mutex->waiting_threads, data_it, export_name, timeout);
 
-            if (res != SCE_KERNEL_OK || mutex->owner == thread || thread->is_delete_requested())
+            if (res != SCE_KERNEL_OK || mutex->owner_id == thread_id || thread->is_delete_requested())
                 break;
 
             thread_lock.lock();
@@ -790,24 +794,25 @@ inline static int mutex_lock_impl(KernelState &kernel, MemState &mem, const char
 
         if (weight == SyncWeight::Light) {
             mutex->workarea.get(mem)->lockCount = mutex->lock_count;
-            if (mutex->owner == thread) {
+            if (mutex->owner_id == thread_id) {
                 mutex->workarea.get(mem)->owner = thread_id;
             }
         }
 
         return res;
     }
-    // Not owned
-    // Take ownership!
+    // Not owned so take ownership i.e. The one place an uncontended lock needs the handle
+    const ThreadStatePtr thread = kernel.get_thread(thread_id);
+    if (!thread) // the thread is being torn down so fail its last import instead of crashing the process
+        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
 
     mutex->lock_count += lock_count;
     mutex->owner = thread;
+    mutex->owner_id = thread_id;
 
     if (weight == SyncWeight::Light) {
         mutex->workarea.get(mem)->lockCount = mutex->lock_count;
-        if (mutex->owner == thread) {
-            mutex->workarea.get(mem)->owner = thread_id;
-        }
+        mutex->workarea.get(mem)->owner = thread_id;
     }
 
     return SCE_KERNEL_OK;
@@ -834,15 +839,11 @@ int mutex_try_lock(KernelState &kernel, MemState &mem, const char *export_name, 
 }
 
 inline static int mutex_unlock_impl(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, int unlock_count, MutexPtr &mutex) {
-    const ThreadStatePtr current_thread = kernel.get_thread(thread_id);
-    if (!current_thread) // the thread is being torn down so fail its last import instead of crashing the process
-        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
-
     int woken_prio = 0x7fffffff; // priority of the thread we hand the mutex to, if any (preempt-on-wake)
     {
         const std::lock_guard<std::mutex> mutex_lock(mutex->mutex);
 
-        if (current_thread == mutex->owner) {
+        if (mutex->owner_id == thread_id) {
             if (unlock_count > mutex->lock_count) {
                 return RET_ERROR(SCE_KERNEL_ERROR_LW_MUTEX_UNLOCK_UDF);
             }
@@ -851,6 +852,7 @@ inline static int mutex_unlock_impl(KernelState &kernel, MemState &mem, const ch
 
             if (mutex->lock_count == 0) {
                 mutex->owner = nullptr;
+                mutex->owner_id = 0;
 
                 if (!mutex->waiting_threads->empty()) {
                     const auto waiting_thread_data = *mutex->waiting_threads->begin();
@@ -864,6 +866,7 @@ inline static int mutex_unlock_impl(KernelState &kernel, MemState &mem, const ch
                     mutex->waiting_threads->pop();
                     mutex->lock_count += waiting_lock_count;
                     mutex->owner = waiting_thread;
+                    mutex->owner_id = waiting_thread->id;
                 }
             }
 
@@ -878,8 +881,8 @@ inline static int mutex_unlock_impl(KernelState &kernel, MemState &mem, const ch
             static std::atomic<uint32_t> foreign_unlocks{ 0 };
             const uint32_t n = foreign_unlocks.fetch_add(1, std::memory_order_relaxed) + 1;
             if (n <= 16 || (n & 1023) == 0)
-                LOG_WARN("[LWMUTEX] {}: thread '{}' ({}) unlocked mutex#{} '{}' it does not own (owner {}, lock_count {}) - ignored (#{})",
-                    export_name, current_thread->name, thread_id, mutex->uid, mutex->name,
+                LOG_WARN("[LWMUTEX] {}: thread {} unlocked mutex#{} '{}' it does not own (owner {}, lock_count {}) - ignored (#{})",
+                    export_name, thread_id, mutex->uid, mutex->name,
                     mutex->owner ? fmt::format("'{}' ({})", mutex->owner->name, mutex->owner->id) : std::string("nobody"), mutex->lock_count, n);
         }
     }
