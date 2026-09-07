@@ -559,12 +559,32 @@ EXPORT(int, sceNetCheckDialogGetPS3ConnectInfo) {
     return UNIMPLEMENTED();
 }
 
+// Only the modes that need PSN or a PS3 are refused and only when the user has not asked us to pretend to be signed in
+static bool netcheck_mode_needs_psn(SceNetCheckDialogMode mode) {
+    switch (mode) {
+    case SCE_NETCHECK_DIALOG_MODE_PSN:
+    case SCE_NETCHECK_DIALOG_MODE_PSN_ONLINE:
+    case SCE_NETCHECK_DIALOG_MODE_PS3_CONNECT:
+        return true;
+    default:
+        // ADHOC_CONN and the three PSP adhoc modes, plus INVALID
+        return false;
+    }
+}
+
 EXPORT(int, sceNetCheckDialogGetResult, SceNetCheckDialogResult *result) {
     TRACY_FUNC(sceNetCheckDialogGetResult, result);
+    if (!result)
+        return RET_ERROR(SCE_COMMON_DIALOG_ERROR_NULL);
+
+    *result = {};
     result->result = emuenv.common_dialog.result;
 
-    if (emuenv.common_dialog.netcheck.mode != SCE_NETCHECK_DIALOG_MODE_ADHOC_CONN)
-        STUBBED("result->result = 0");
+    if (netcheck_mode_needs_psn(emuenv.common_dialog.netcheck.mode)) {
+        const bool pretend_signed_in = emuenv.cfg.current_config.psn_signed_in;
+        result->result = pretend_signed_in ? SCE_COMMON_DIALOG_RESULT_OK : SCE_COMMON_DIALOG_RESULT_USER_CANCELED;
+        result->psnModeSucceeded = pretend_signed_in;
+    }
 
     return 0;
 }
