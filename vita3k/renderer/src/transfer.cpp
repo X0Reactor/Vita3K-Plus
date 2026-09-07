@@ -19,8 +19,8 @@
 #include <vector>
 
 #include <gxm/functions.h>
-#include <mem/functions.h>
 #include <gxm/types.h>
+#include <mem/functions.h>
 #include <renderer/commands.h>
 #include <renderer/driver_functions.h>
 #include <renderer/functions.h>

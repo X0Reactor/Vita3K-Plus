@@ -270,7 +270,7 @@ EXPORT(int, sceImeDialogTerm) {
         emuenv.ime.str.clear();
         emuenv.ime.caretIndex = 0;
         emuenv.ime.edit_text = {};
-        emuenv.ime.event_id = SCE_IME_EVENT_OPEN;
+        emuenv.ime.events.clear();
     }
 
 #ifdef __ANDROID__
