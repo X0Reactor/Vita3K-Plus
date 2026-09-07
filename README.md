@@ -10,6 +10,8 @@ https://github.com/nckstwrt/Vita3K-Plus/releases
 
 > **Snapdragon / Adreno:** Use Turnip drivers for the best compatibility.
 
+> **Mali Users:** There are things that will definitely not work and most likely never work with Mali. Very little I can (or want) to do about that I'm afraid.
+
 > **Freezing or hangs:** Enable **Accurate Thread Scheduling** in Graphics settings.  
 > This is needed for games such as *Dead or Alive 5 Plus*, *Sonic*, *Samurai Warriors 3*, etc.
 
@@ -36,6 +38,9 @@ https://github.com/nckstwrt/Vita3K-Plus/releases
 - **UPPERS** - Graphics Fixed
 - **Madden 13** - Face textures fixed
 - **Oddworld: New'n'Tasty** - Graphics Fixed
+- **God Breaker 3** - Graphics Fixed
+- **Sword Art Online** - Latest game patch now works
+- 
 - Defaults now to External Host for Windows and Native Buffer on Android. **Use these Memory Mapping options for the best compatibility**
 - Lots of memory, timing and sound improvements
 - Thanks to Reyes for all his help testing!
