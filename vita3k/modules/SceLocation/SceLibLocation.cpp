@@ -125,6 +125,11 @@ static void log_location(const char *what, SceLocationHandle handle, int result)
     LOG_INFO("[LOCATION] {} handle {} -> 0x{:X} (call {})", what, handle, static_cast<uint32_t>(result), n);
 }
 
+template <typename T>
+static bool writable(const MemState &mem, const Ptr<T> &p) {
+    return p && p.valid(mem);
+}
+
 EXPORT(int, sceLocationInit, SceUInt32 unk0, SceUInt32 unk1) {
     TRACY_FUNC(sceLocationInit, unk0, unk1);
     LocationState *state = emuenv.kernel.obj_store.get<LocationState>();
@@ -146,9 +151,9 @@ EXPORT(int, sceLocationTerm) {
     return 0;
 }
 
-EXPORT(int, sceLocationOpen, SceLocationHandle *handle, SceUInt32 locateMethod, SceUInt32 headingMethod) {
+EXPORT(int, sceLocationOpen, Ptr<SceLocationHandle> handle, SceUInt32 locateMethod, SceUInt32 headingMethod) {
     TRACY_FUNC(sceLocationOpen, handle, locateMethod, headingMethod);
-    if (!handle)
+    if (!writable(emuenv.mem, handle))
         return RET_ERROR(SCE_LOCATION_ERROR_INVALID_ADDRESS);
 
     LocationState *state = emuenv.kernel.obj_store.get<LocationState>();
@@ -158,7 +163,7 @@ EXPORT(int, sceLocationOpen, SceLocationHandle *handle, SceUInt32 locateMethod, 
     LocationHandleState &opened = state->handles[id];
     opened.locate_method = locateMethod;
     opened.heading_method = headingMethod;
-    *handle = id;
+    *handle.get(emuenv.mem) = id;
     log_location("sceLocationOpen", id, 0);
     return 0;
 }
@@ -185,7 +190,7 @@ EXPORT(int, sceLocationReopen, SceLocationHandle handle, SceUInt32 locateMethod,
     return 0;
 }
 
-EXPORT(int, sceLocationGetMethod, SceLocationHandle handle, SceUInt32 *locateMethod, SceUInt32 *headingMethod) {
+EXPORT(int, sceLocationGetMethod, SceLocationHandle handle, Ptr<SceUInt32> locateMethod, Ptr<SceUInt32> headingMethod) {
     TRACY_FUNC(sceLocationGetMethod, handle, locateMethod, headingMethod);
     LocationState *state = emuenv.kernel.obj_store.get<LocationState>();
     std::lock_guard<std::mutex> lock(state->mutex);
@@ -194,29 +199,33 @@ EXPORT(int, sceLocationGetMethod, SceLocationHandle handle, SceUInt32 *locateMet
         return RET_ERROR(SCE_LOCATION_ERROR_INVALID_HANDLE);
     if (!locateMethod && !headingMethod)
         return RET_ERROR(SCE_LOCATION_ERROR_INVALID_ADDRESS);
+    if (locateMethod && !writable(emuenv.mem, locateMethod))
+        return RET_ERROR(SCE_LOCATION_ERROR_INVALID_ADDRESS);
+    if (headingMethod && !writable(emuenv.mem, headingMethod))
+        return RET_ERROR(SCE_LOCATION_ERROR_INVALID_ADDRESS);
     if (locateMethod)
-        *locateMethod = opened->locate_method;
+        *locateMethod.get(emuenv.mem) = opened->locate_method;
     if (headingMethod)
-        *headingMethod = opened->heading_method;
+        *headingMethod.get(emuenv.mem) = opened->heading_method;
     return 0;
 }
 
-EXPORT(int, sceLocationGetLocation, SceLocationHandle handle, SceLocationLocationInfo *locationInfo) {
+EXPORT(int, sceLocationGetLocation, SceLocationHandle handle, Ptr<SceLocationLocationInfo> locationInfo) {
     TRACY_FUNC(sceLocationGetLocation, handle, locationInfo);
-    if (!locationInfo)
+    if (!writable(emuenv.mem, locationInfo))
         return RET_ERROR(SCE_LOCATION_ERROR_INVALID_ADDRESS);
     LocationState *state = emuenv.kernel.obj_store.get<LocationState>();
     std::lock_guard<std::mutex> lock(state->mutex);
     if (!find_handle(state, handle))
         return RET_ERROR(SCE_LOCATION_ERROR_INVALID_HANDLE);
 
-    *locationInfo = {};
+    *locationInfo.get(emuenv.mem) = {};
     log_location("sceLocationGetLocation", handle, SCE_LOCATION_INFO_LOCATION_NOT_AVAILABLE);
     return RET_ERROR(SCE_LOCATION_INFO_LOCATION_NOT_AVAILABLE);
 }
 
-EXPORT(int, sceLocationGetLocationWithTimeout, SceLocationHandle handle, SceLocationLocationInfo *locationInfo, SceUInt32 timeout) {
-    TRACY_FUNC(sceLocationGetLocationWithTimeout, handle, locationInfo, timeout);
+EXPORT(int, sceLocationGetLocationWithTimeout, SceLocationHandle handle, SceUInt32 timeout, Ptr<SceLocationLocationInfo> locationInfo) {
+    TRACY_FUNC(sceLocationGetLocationWithTimeout, handle, timeout, locationInfo);
     return CALL_EXPORT(sceLocationGetLocation, handle, locationInfo);
 }
 
@@ -249,20 +258,21 @@ EXPORT(int, sceLocationStopLocationCallback, SceLocationHandle handle) {
     return 0;
 }
 
-EXPORT(int, sceLocationGetHeading, SceLocationHandle handle, SceLocationHeadingInfo *headingInfo) {
+EXPORT(int, sceLocationGetHeading, SceLocationHandle handle, Ptr<SceLocationHeadingInfo> headingInfo) {
     TRACY_FUNC(sceLocationGetHeading, handle, headingInfo);
-    if (!headingInfo)
+    if (!writable(emuenv.mem, headingInfo))
         return RET_ERROR(SCE_LOCATION_ERROR_INVALID_ADDRESS);
     LocationState *state = emuenv.kernel.obj_store.get<LocationState>();
     std::lock_guard<std::mutex> lock(state->mutex);
     if (!find_handle(state, handle))
         return RET_ERROR(SCE_LOCATION_ERROR_INVALID_HANDLE);
 
-    *headingInfo = {};
+    *headingInfo.get(emuenv.mem) = {};
     log_location("sceLocationGetHeading", handle, SCE_LOCATION_INFO_HEADING_NOT_AVAILABLE);
     return RET_ERROR(SCE_LOCATION_INFO_HEADING_NOT_AVAILABLE);
 }
 
+// TODO: The shape of this must be varified and fixed before its ever used!
 EXPORT(int, sceLocationStartHeadingCallback, SceLocationHandle handle, SceUInt32 difference, Ptr<void> callback, Ptr<void> userdata) {
     TRACY_FUNC(sceLocationStartHeadingCallback, handle, difference, callback, userdata);
     LocationState *state = emuenv.kernel.obj_store.get<LocationState>();
@@ -296,30 +306,30 @@ EXPORT(int, sceLocationConfirm, SceLocationHandle handle) {
     return 0;
 }
 
-EXPORT(int, sceLocationConfirmGetStatus, SceLocationHandle handle, SceUInt32 *status) {
+EXPORT(int, sceLocationConfirmGetStatus, SceLocationHandle handle, Ptr<SceUInt32> status) {
     TRACY_FUNC(sceLocationConfirmGetStatus, handle, status);
     LocationState *state = emuenv.kernel.obj_store.get<LocationState>();
     std::lock_guard<std::mutex> lock(state->mutex);
     LocationHandleState *opened = find_handle(state, handle);
     if (!opened)
         return RET_ERROR(SCE_LOCATION_ERROR_INVALID_HANDLE);
-    if (!status)
+    if (!writable(emuenv.mem, status))
         return RET_ERROR(SCE_LOCATION_ERROR_INVALID_ADDRESS);
-    *status = opened->dialog_status;
+    *status.get(emuenv.mem) = opened->dialog_status;
     log_location("sceLocationConfirmGetStatus", handle, opened->dialog_status);
     return 0;
 }
 
-EXPORT(int, sceLocationConfirmGetResult, SceLocationHandle handle, SceUInt32 *result) {
+EXPORT(int, sceLocationConfirmGetResult, SceLocationHandle handle, Ptr<SceUInt32> result) {
     TRACY_FUNC(sceLocationConfirmGetResult, handle, result);
     LocationState *state = emuenv.kernel.obj_store.get<LocationState>();
     std::lock_guard<std::mutex> lock(state->mutex);
     LocationHandleState *opened = find_handle(state, handle);
     if (!opened)
         return RET_ERROR(SCE_LOCATION_ERROR_INVALID_HANDLE);
-    if (!result)
+    if (!writable(emuenv.mem, result))
         return RET_ERROR(SCE_LOCATION_ERROR_INVALID_ADDRESS);
-    *result = opened->dialog_result;
+    *result.get(emuenv.mem) = opened->dialog_result;
     log_location("sceLocationConfirmGetResult", handle, opened->dialog_result);
     return 0;
 }
@@ -336,7 +346,7 @@ EXPORT(int, sceLocationConfirmAbort, SceLocationHandle handle) {
     return 0;
 }
 
-EXPORT(int, sceLocationGetPermission, SceLocationHandle handle, SceLocationPermissionInfo *info) {
+EXPORT(int, sceLocationGetPermission, SceLocationHandle handle, Ptr<SceLocationPermissionInfo> info) {
     TRACY_FUNC(sceLocationGetPermission, handle, info);
     LocationState *state = emuenv.kernel.obj_store.get<LocationState>();
     std::lock_guard<std::mutex> lock(state->mutex);
@@ -344,13 +354,16 @@ EXPORT(int, sceLocationGetPermission, SceLocationHandle handle, SceLocationPermi
         return RET_ERROR(SCE_LOCATION_ERROR_INVALID_HANDLE);
     if (!info)
         return 0;
+    if (!writable(emuenv.mem, info))
+        return RET_ERROR(SCE_LOCATION_ERROR_INVALID_ADDRESS);
 
     // confirm_required must stay 0! A 1 is what sends a guest into the confirm loop regardless of status
-    info->parentalstatus = SCE_LOCATION_PERMISSION_ALLOW;
-    info->mainstatus = SCE_LOCATION_PERMISSION_ALLOW;
-    info->applicationstatus = SCE_LOCATION_PERMISSION_APPLICATION_ALLOW;
-    info->confirm_required = 0;
-    info->reserved = 0;
+    SceLocationPermissionInfo *out = info.get(emuenv.mem);
+    out->parentalstatus = SCE_LOCATION_PERMISSION_ALLOW;
+    out->mainstatus = SCE_LOCATION_PERMISSION_ALLOW;
+    out->applicationstatus = SCE_LOCATION_PERMISSION_APPLICATION_ALLOW;
+    out->confirm_required = 0;
+    out->reserved = 0;
     log_location("sceLocationGetPermission", handle, 0);
     return 0;
 }
