@@ -40,9 +40,11 @@ https://github.com/nckstwrt/Vita3K-Plus/releases
 - **Oddworld: New'n'Tasty** - Graphics Fixed
 - **God Breaker 3** - Graphics Fixed
 - **Sword Art Online** - Latest game patch now works
+- **Disgaea 3** - Saving & Loading now work. liblocation implemented to hopefully stop the 50 min crashes.
+- **Borderlands 2** - Shorten time it checks for PSN
 - 
 - Defaults now to External Host for Windows and Native Buffer on Android. **Use these Memory Mapping options for the best compatibility**
-- Lots of memory, timing and sound improvements
+- Lots of memory, timing, IME and sound improvements
 - Thanks to Reyes for all his help testing!
 
 # v1.0
