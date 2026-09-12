@@ -40,7 +40,7 @@ void USSETranslatorVisitor::store(Operand dest, spv::Id source, std::uint8_t des
             const uint32_t byte_off = i * type_size;
             const uint32_t word = (dest.num + shift_offset + byte_off / 4) & 0xFFFFFF;
             const uint32_t key = (static_cast<uint32_t>(dest.bank) << 24) | word;
-            if (m_store_from_texture_sample) {
+            if (m_store_from_texture_sample || is_integer_data_type(dest.type)) {
                 const std::uint8_t lane_bytes = static_cast<std::uint8_t>(((type_size >= 4) ? 0xFu : ((1u << type_size) - 1)) << (byte_off % 4));
                 m_vpck_written_bytes[key] |= lane_bytes;
             } else {

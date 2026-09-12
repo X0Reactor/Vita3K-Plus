@@ -73,6 +73,11 @@ static bool format_need_additional_memory(SceGxmColorBaseFormat format) {
 
 namespace renderer::vulkan {
 
+static bool is_small_writeback_surface(const SurfaceTiling tiling, const uint32_t width, const uint32_t height) {
+    return sync_fully_rendered_small_linear && (tiling == SurfaceTiling::Linear || tiling == SurfaceTiling::Tiled)
+        && width <= SMALL_LINEAR_SURFACE_LIMIT && height <= SMALL_LINEAR_SURFACE_LIMIT;
+}
+
 static bool surface_sync_needs_u4u4u4u4_repack(const ColorSurfaceCacheInfo &surface) {
     return surface.format == SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4
         && (surface.texture.format == vk::Format::eR8G8B8A8Unorm
@@ -804,15 +809,14 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
     info_added.content_is_blended = false;
     info_added.reinterpret_view_is_raw = false;
 
-    // we only support surface sync of linear surfaces for now
+    // linear surfaces and small tiled ones sync
     if (!can_mprotect_mapped_memory) {
         // perform surface sync on everything
         // it is slow but well... we can't mprotect the buffer
-        *info_added.need_surface_sync = color->surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR;
+        *info_added.need_surface_sync = color->surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR || is_small_writeback_surface(tiling, original_width, original_height);
     } else {
         protect_surface(mem, info_added);
-        if (sync_fully_rendered_small_linear && tiling == SurfaceTiling::Linear
-            && original_width <= SMALL_LINEAR_SURFACE_LIMIT && original_height <= SMALL_LINEAR_SURFACE_LIMIT) {
+        if (is_small_writeback_surface(tiling, original_width, original_height)) {
             *info_added.need_surface_sync = true;
         }
     }
@@ -2369,6 +2373,11 @@ ColorSurfaceCacheInfo *VKSurfaceCache::perform_surface_sync() {
 
     const uint32_t pixel_stride = (last_written_surface->stride_bytes * 8) / gxm::bits_per_pixel(last_written_surface->format);
     const bool needs_copy_buffer = format_need_additional_memory(last_written_surface->format) || surface_sync_needs_u4u4u4u4_repack(*last_written_surface) || surface_sync_needs_f10_repack(*last_written_surface) || surface_sync_needs_se5_repack(*last_written_surface);
+    const bool tiled_layout = last_written_surface->tiling == SurfaceTiling::Tiled;
+
+    // The CPU repacks and in-place swizzle both walk memory as rows which tiled memory isn't
+    if (tiled_layout && (needs_copy_buffer || !is_swizzle_identity))
+        return nullptr;
 
     // For macrotile-sync surfaces at non-integer scale factors, clamp the sync
     // to only the rendered macroblocks.
@@ -2415,9 +2424,7 @@ ColorSurfaceCacheInfo *VKSurfaceCache::perform_surface_sync() {
             rt_clamped = true;
         }
     }
-    if (sync_fully_rendered_small_linear && last_written_surface->tiling == SurfaceTiling::Linear
-        && last_written_surface->original_width <= SMALL_LINEAR_SURFACE_LIMIT
-        && last_written_surface->original_height <= SMALL_LINEAR_SURFACE_LIMIT) {
+    if (is_small_writeback_surface(last_written_surface->tiling, last_written_surface->original_width, last_written_surface->original_height)) {
         const ColorSurfaceCacheInfo &ws = *last_written_surface;
         const bool covers_all = ws.written_x0 <= 0 && ws.written_y0 <= 0
             && ws.written_x1 >= static_cast<int32_t>(ws.original_width)
@@ -2537,9 +2544,20 @@ ColorSurfaceCacheInfo *VKSurfaceCache::perform_surface_sync() {
         last_written_surface->need_buffer_sync = false;
         last_written_surface->need_post_surface_sync = true;
     } else {
+        std::tie(buffer, offset) = state.get_matching_mapping(last_written_surface->data);
+        if (!buffer) {
+            // no GPU mapping backs this memory meaning there is nowhere to copy the rendered image
+            return nullptr;
+        }
+        if (tiled_layout) {
+            // whole tiles can reach past stride x height when the height is not a multiple of 32 !
+            const uint32_t tiled_bytes = (align(last_written_surface->original_width, 32) >> 5) * (align(last_written_surface->original_height, 32) >> 5) * 1024 * static_cast<uint32_t>(vk::blockSize(sync_format));
+            const auto [end_buffer, end_offset] = state.get_matching_mapping(Ptr<void>(last_written_surface->data.address() + tiled_bytes - 1));
+            if (end_buffer != buffer || end_offset != offset + tiled_bytes - 1)
+                return nullptr;
+        }
         last_written_surface->need_buffer_sync = !last_written_surface->gpu_read_sync_only;
         last_written_surface->need_post_surface_sync = !is_swizzle_identity;
-        std::tie(buffer, offset) = state.get_matching_mapping(last_written_surface->data);
     }
 
     vk::BufferImageCopy copy{
@@ -2558,7 +2576,37 @@ ColorSurfaceCacheInfo *VKSurfaceCache::perform_surface_sync() {
         copy.imageExtent = { sync_w, sync_h, 1 };
     }
 
-    cmd_buffer.copyImageToBuffer(image_to_copy, image_layout, buffer, copy);
+    if (tiled_layout) {
+        // tiled memory holds 32x32 tiles one after another so every tile is copied straight into its own place
+        const uint32_t texel_bytes = static_cast<uint32_t>(vk::blockSize(sync_format));
+        const uint32_t tiles_per_row = align(last_written_surface->original_width, 32) >> 5;
+        const uint32_t tile_rows = align(last_written_surface->original_height, 32) >> 5;
+        const int32_t sync_x1 = std::min(sync_x0 + static_cast<int32_t>(sync_w), static_cast<int32_t>(last_written_surface->original_width));
+        const int32_t sync_y1 = std::min(sync_y0 + static_cast<int32_t>(sync_h), static_cast<int32_t>(last_written_surface->original_height));
+        std::vector<vk::BufferImageCopy> tile_copies;
+        tile_copies.reserve(tiles_per_row * tile_rows);
+        for (uint32_t ty = 0; ty < tile_rows; ty++) {
+            for (uint32_t tx = 0; tx < tiles_per_row; tx++) {
+                const int32_t tile_x0 = static_cast<int32_t>(tx << 5), tile_y0 = static_cast<int32_t>(ty << 5);
+                const int32_t x0 = std::max(tile_x0, sync_x0), y0 = std::max(tile_y0, sync_y0);
+                const int32_t x1 = std::min(tile_x0 + 32, sync_x1), y1 = std::min(tile_y0 + 32, sync_y1);
+                if (x1 <= x0 || y1 <= y0)
+                    continue;
+                const uint32_t texel_in_tile = (static_cast<uint32_t>(y0 - tile_y0) << 5) | static_cast<uint32_t>(x0 - tile_x0);
+                tile_copies.push_back(vk::BufferImageCopy{
+                    .bufferOffset = offset + (static_cast<vk::DeviceSize>(ty * tiles_per_row + tx) * 1024 + texel_in_tile) * texel_bytes,
+                    .bufferRowLength = 32,
+                    .bufferImageHeight = 32,
+                    .imageSubresource = vkutil::color_subresource_layer,
+                    .imageOffset = { x0, y0, 0 },
+                    .imageExtent = { static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0), 1 } });
+            }
+        }
+        if (!tile_copies.empty())
+            cmd_buffer.copyImageToBuffer(image_to_copy, image_layout, buffer, tile_copies);
+    } else {
+        cmd_buffer.copyImageToBuffer(image_to_copy, image_layout, buffer, copy);
+    }
 
     ColorSurfaceCacheInfo *return_value = last_written_surface;
     last_written_surface = nullptr;
