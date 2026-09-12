@@ -1733,26 +1733,45 @@ int KernelState::try_break_provable_evf_cycle(bool dry_run) {
         setters_snapshot = evf_setters;
     }
 
+    constexpr uint64_t PROVABLE_DEAD_STABLE_MS = 3000;
+    static std::mutex dead_since_mutex;
+    static std::unordered_map<SceUID, uint64_t> dead_since;
+    const uint64_t now_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+
     int broken = 0;
+    std::set<SceUID> dead_now;
     for (auto &[uid, fi] : flags) {
         const auto st = setters_snapshot.find(uid);
-        if (st == setters_snapshot.end() || st->second.empty())
-            continue; // nobody ever set it ?!
-        bool all_setters_blocked_here = true;
-        for (const SceUID setter : st->second) {
-            const auto w = thread_waits_on.find(setter);
-            if (w == thread_waits_on.end() || !flags.count(w->second)) {
-                all_setters_blocked_here = false;
-                break;
+        bool all_setters_blocked_here = st != setters_snapshot.end() && !st->second.empty();
+        if (all_setters_blocked_here) {
+            for (const SceUID setter : st->second) {
+                const auto w = thread_waits_on.find(setter);
+                if (w == thread_waits_on.end() || !flags.count(w->second)) {
+                    all_setters_blocked_here = false;
+                    break;
+                }
             }
         }
         if (!all_setters_blocked_here)
             continue;
-        LOG_WARN("[EVFCYCLE]{} flag {} '{}' looks PROVABLY dead: every historical setter is itself blocked on a flag with waiters - {} bits 0x{:X}",
-            dry_run ? " (DRY-RUN)" : "", uid, fi.event->name, dry_run ? "would set" : "setting", fi.wanted_union);
-        if (!dry_run)
-            eventflag_set(*this, "provable_cycle_breaker", 0, uid, fi.wanted_union);
+        dead_now.insert(uid);
+        uint64_t dead_for_ms = 0;
+        {
+            const std::lock_guard<std::mutex> lock(dead_since_mutex);
+            dead_for_ms = now_ms - dead_since.try_emplace(uid, now_ms).first->second;
+        }
+        const bool stable = dead_for_ms >= PROVABLE_DEAD_STABLE_MS;
+        LOG_WARN("[EVFCYCLE]{} flag {} '{}' looks PROVABLY dead for {} ms: every historical setter is itself blocked on a flag with waiters - {} bits 0x{:X}",
+            dry_run ? " (DRY-RUN)" : "", uid, fi.event->name, dead_for_ms,
+            dry_run ? "would set" : (stable ? "setting" : "waiting for the verdict to hold before setting"), fi.wanted_union);
+        if (dry_run || !stable)
+            continue;
+        eventflag_set(*this, "provable_cycle_breaker", 0, uid, fi.wanted_union);
         broken++;
+    }
+    {
+        const std::lock_guard<std::mutex> lock(dead_since_mutex);
+        std::erase_if(dead_since, [&dead_now](const auto &entry) { return !dead_now.count(entry.first); });
     }
     return broken;
 }

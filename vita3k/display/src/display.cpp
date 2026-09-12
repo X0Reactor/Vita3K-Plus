@@ -315,7 +315,7 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
 
             // Cycle breaker
             constexpr uint64_t PROVABLE_DRYRUN_VBLANKS = 120;
-            constexpr uint64_t PROVABLE_BREAK_VBLANKS = 3600;
+            constexpr uint64_t PROVABLE_BREAK_VBLANKS = 300;
             const int64_t now_epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
             const bool world_stop_quiet = (now_epoch_ms - emuenv.kernel.last_world_stop_epoch_ms.load(std::memory_order_relaxed)) >= 5000;
             // deferred-unmap collapses remaps WITHOUT world-stops, blinding the veto above; transitions are stamped regardless
