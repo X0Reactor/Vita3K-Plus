@@ -353,6 +353,13 @@ bool USSETranslatorVisitor::smp(
     Imm7 src0_n,
     Imm7 src1_n,
     Imm7 src2_n) {
+    struct SampleStoreScope {
+        bool &flag;
+        explicit SampleStoreScope(bool &f)
+            : flag(f) { flag = true; }
+        ~SampleStoreScope() { flag = false; }
+    } sample_store_scope(m_store_from_texture_sample);
+
     // Decode src0
     Instruction inst;
     inst.opr.src0 = decode_src0(inst.opr.src0, src0_n, src0_bank, src0_ext, true, 8, m_second_program);

@@ -172,6 +172,15 @@ inline static int find_condvar(CondvarPtr &condvar_out, CondvarPtrs **condvars_o
     return SCE_KERNEL_OK;
 }
 
+// A callback notified while its owner is already blocked cannot wake it
+inline static bool callback_pending(const std::vector<CallbackPtr> &callbacks) {
+    for (const CallbackPtr &cb : callbacks) {
+        if (cb->is_executable())
+            return true;
+    }
+    return false;
+}
+
 // TODO: Write remaining time to timeout ptr when it's successfully signaled
 // Assumes primitive_lock is locked and thread_lock is unlocked
 inline static int handle_timeout(KernelState &kernel, const ThreadStatePtr &thread, std::unique_lock<std::mutex> &thread_lock,
@@ -180,37 +189,58 @@ inline static int handle_timeout(KernelState &kernel, const ThreadStatePtr &thre
     SceUInt *const timeout) {
     guest_sched_release_for_block();
 
+    // the kernel runs a callback on a blocked thread and then resumes its wait
+    const std::vector<CallbackPtr> callbacks = thread_in_callback_wait() ? thread->callbacks : std::vector<CallbackPtr>();
+    const bool cb_wait = !callbacks.empty();
+    constexpr uint32_t CALLBACK_POLL_US = 2000;
+    // A waker holding only thread->mutex can miss this condition variable so rechecking it on a timer
+    constexpr uint32_t WAKE_RECHECK_US = 20000;
+
+    auto unwind = [&]() {
+        thread_lock.lock();
+        thread->update_status(ThreadStatus::run, ThreadStatus::wait);
+        thread_lock.unlock();
+
+        queue->erase(data_it);
+    };
+
     if (timeout) {
+        const uint32_t budget = *timeout;
+        const auto start = std::chrono::steady_clock::now();
         bool status = false;
-        auto start = std::chrono::steady_clock::now();
-        if (*timeout > 0) {
-            status = thread->wait_for_run_precise(primitive_lock, static_cast<int64_t>(*timeout));
-        }
+        bool interrupted = false;
+        uint32_t used = 0;
 
-        if (!status) {
-            *timeout = 0; // Time run out, so remaining time is 0
-
-            thread_lock.lock();
-            thread->update_status(ThreadStatus::run, ThreadStatus::wait);
-            thread_lock.unlock();
-
-            queue->erase(data_it);
-
-            return RET_ERROR(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
-        } else {
-            auto end = std::chrono::steady_clock::now();
-            uint32_t real_timeout = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
-            if (real_timeout > *timeout) {
-                *timeout = 0;
-            } else {
-                *timeout = *timeout - real_timeout;
+        while (used < budget) {
+            const uint32_t slice = cb_wait ? std::min(budget - used, CALLBACK_POLL_US) : (budget - used);
+            status = thread->wait_for_run_precise(primitive_lock, static_cast<int64_t>(slice));
+            used = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+            if (status)
+                break;
+            if (cb_wait && callback_pending(callbacks)) {
+                interrupted = true;
+                break;
             }
         }
+
+        *timeout = (used >= budget) ? 0 : budget - used;
+
+        if (!status) {
+            unwind();
+
+            return interrupted ? VITA3K_WAIT_INTERRUPTED_BY_CB : RET_ERROR(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+        }
     } else {
-        // A waker holding only thread->mutex can miss this condition variable so recheck it on a timer
-        constexpr auto WAKE_RECHECK_MS = std::chrono::milliseconds(20);
-        while (thread->status != ThreadStatus::run)
-            thread->status_cond.wait_for(primitive_lock, WAKE_RECHECK_MS);
+        const auto recheck = std::chrono::microseconds(cb_wait ? CALLBACK_POLL_US : WAKE_RECHECK_US);
+        while (thread->status != ThreadStatus::run) {
+            thread->status_cond.wait_for(primitive_lock, recheck);
+
+            if (cb_wait && thread->status != ThreadStatus::run && callback_pending(callbacks)) {
+                unwind();
+
+                return VITA3K_WAIT_INTERRUPTED_BY_CB;
+            }
+        }
     }
 
     return SCE_KERNEL_OK;
@@ -1427,6 +1457,8 @@ int condvar_wait(KernelState &kernel, MemState &mem, const char *export_name, Sc
     const int wait_res = handle_timeout(kernel, thread, thread_lock, condition_variable_lock, condvar->waiting_threads, data_it, export_name, timeout);
     condition_variable_lock.unlock();
     cond_record(condvar->uid, thread_id, 1, static_cast<uint32_t>(condvar->waiting_threads->size()), wait_res);
+
+    const CallbackWaitScope no_callbacks(false);
 
     // The kernel hands the associated mutex back to the waiter before returning no matter how the wait
     // ended, and Sony's own libraries depend on that: the Fios scheduler records itself as the owner of

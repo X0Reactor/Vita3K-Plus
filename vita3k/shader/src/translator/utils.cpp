@@ -37,8 +37,15 @@ void USSETranslatorVisitor::store(Operand dest, spv::Id source, std::uint8_t des
         for (int i = 0; i < 4; i++) {
             if (!(dest_mask & (1 << i)))
                 continue;
-            const uint32_t word = (dest.num + shift_offset + (i * type_size) / 4) & 0xFFFFFF;
-            m_vpck_written_bytes.erase((static_cast<uint32_t>(dest.bank) << 24) | word);
+            const uint32_t byte_off = i * type_size;
+            const uint32_t word = (dest.num + shift_offset + byte_off / 4) & 0xFFFFFF;
+            const uint32_t key = (static_cast<uint32_t>(dest.bank) << 24) | word;
+            if (m_store_from_texture_sample) {
+                const std::uint8_t lane_bytes = static_cast<std::uint8_t>(((type_size >= 4) ? 0xFu : ((1u << type_size) - 1)) << (byte_off % 4));
+                m_vpck_written_bytes[key] |= lane_bytes;
+            } else {
+                m_vpck_written_bytes.erase(key);
+            }
         }
     }
     utils::store(m_b, m_spirv_params, m_util_funcs, m_features, dest, source, dest_mask, shift_offset, m_store_is_raw_move);

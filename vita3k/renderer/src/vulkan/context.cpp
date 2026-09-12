@@ -294,7 +294,7 @@ void set_context(VKContext &context, MemState &mem, VKRenderTarget *rt, const Fe
         // also retrieve / create the shader interlock pass
         context.current_shader_interlock_pass = context.state.pipeline_cache.retrieve_render_pass(vk_format, true, true, true, color_surface_fin == nullptr, true);
 
-    Framebuffer &framebuffer = state.surface_cache.retrieve_framebuffer_handle(mem, color_surface_fin, ds_surface_fin, context.current_render_pass, context.current_shader_interlock_pass, context.current_color_view, context.current_ds_view);
+    Framebuffer &framebuffer = state.surface_cache.retrieve_framebuffer_handle(mem, color_surface_fin, ds_surface_fin, context.current_render_pass, context.current_shader_interlock_pass, context.current_color_view, context.current_ds_view, context.current_color_storage_view);
     context.current_framebuffer = framebuffer.standard;
     context.current_shader_interlock_framebuffer = framebuffer.shader_interlock;
     context.current_color_base_image = framebuffer.base_image;
@@ -506,13 +506,14 @@ void VKContext::start_render_pass(bool create_descriptor_set) {
     rendertarget_set = retrieve_color_descriptor(state, state.frame().color_descriptor);
 
     // update descriptor set for the whole scene with the color attachment
+    const vk::DescriptorType input_type = state.features.support_shader_interlock ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eInputAttachment;
+
+    // a storage image may not be sRGB and the shader converts for itself, but an input attachment wants the real format
     vk::DescriptorImageInfo descr_color_info{
         .sampler = nullptr,
-        .imageView = current_color_view,
+        .imageView = (input_type == vk::DescriptorType::eStorageImage && current_color_storage_view) ? current_color_storage_view : current_color_view,
         .imageLayout = vk::ImageLayout::eGeneral,
     };
-
-    const vk::DescriptorType input_type = state.features.support_shader_interlock ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eInputAttachment;
     vk::WriteDescriptorSet write_descr{
         .dstSet = rendertarget_set,
         .dstBinding = 0,

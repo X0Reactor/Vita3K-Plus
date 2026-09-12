@@ -205,6 +205,8 @@ private:
     // per 32-bit register word - a mask of bytes a VPCK has written (a f16 lane covers 2 bytes, u8 lane 1)
     std::map<uint32_t, std::uint8_t> m_vpck_written_bytes;
     bool m_store_from_vpck{ false };
+    // a sampled texture leaves real data in its destination therefore a later partial vpck must preserve it
+    bool m_store_from_texture_sample{ false };
     bool m_store_is_raw_move{ false };
 
     spv::Id do_alu_op(Instruction &inst, const Imm4 source_mask, const Imm4 possible_dest_mask);

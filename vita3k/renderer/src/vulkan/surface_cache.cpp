@@ -329,6 +329,7 @@ void VKSurfaceCache::destroy_surface(ColorSurfaceCacheInfo &info) {
 
     destroy_queue.add(info.alternate_view);
     destroy_queue.add(info.reinterpret_store_view);
+    destroy_queue.add(info.linear_storage_view);
 
     if (info.raw_image) {
         destroy_queue.add_image(*info.raw_image);
@@ -673,7 +674,7 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
             info.last_scene_rendered = context->scene_timestamp;
 
             if (vk_format == info.texture.format) {
-                return { info.texture.view, &info.texture, info.raw_image.get() };
+                return { info.texture.view, &info.texture, info.raw_image.get(), color_storage_view(info) };
             } else {
                 // using both srgb/linear
                 if (!info.alternate_view) {
@@ -687,7 +688,7 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
                     info.alternate_view = state.device.createImageView(view_info);
                 }
 
-                return { info.alternate_view, &info.texture, info.raw_image.get() };
+                return { info.alternate_view, &info.texture, info.raw_image.get(), color_storage_view(info) };
             }
         }
     }
@@ -819,7 +820,7 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
     // it's not impossible that this surface will be rendered once and only used after, so do not skip any shader on it
     state.pipeline_cache.can_use_deferred_compilation = false;
 
-    return { info_added.texture.view, &info_added.texture, info_added.raw_image.get() };
+    return { info_added.texture.view, &info_added.texture, info_added.raw_image.get(), color_storage_view(info_added) };
 }
 
 std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_texture(const SceGxmTexture &texture, const SceGxmColorBaseFormat base_format, TextureViewport *texture_viewport) {
@@ -1540,11 +1541,14 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_depth_stencil_for_framebuffer(Sce
 
     const SurfaceTiling tiling = (depth_stencil->get_type() == SCE_GXM_DEPTH_STENCIL_SURFACE_LINEAR) ? SurfaceTiling::Linear : SurfaceTiling::Tiled;
 
-    // check if MSAA is used, the depth buffer is never downscaled
-    if (target->multisample_mode != SCE_GXM_MULTISAMPLE_NONE)
-        memory_height *= 2;
-    if (target->multisample_mode == SCE_GXM_MULTISAMPLE_4X)
-        memory_width *= 2;
+    // the depth buffer is never downscaled, but scene start has already grown the render target to the sample grid unless the colour surface downscales, so only make up the difference here
+    VKContext *scene_context = reinterpret_cast<VKContext *>(state.context);
+    if (!scene_context || scene_context->record.color_surface.downscale) {
+        if (target->multisample_mode != SCE_GXM_MULTISAMPLE_NONE)
+            memory_height *= 2;
+        if (target->multisample_mode == SCE_GXM_MULTISAMPLE_4X)
+            memory_width *= 2;
+    }
 
     const bool is_stencil_only = depth_stencil->depth_data.address() == 0;
     DepthStencilSurfaceCacheInfo *cached_info = nullptr;
@@ -1810,11 +1814,7 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_depth_stencil_as_tex
     // we sample from it, set the surface as most recently used
     ds_surface_queue.set_as_mru(found_info);
 
-    // take MSAA into account
-    if (cached_info.multisample_mode != SCE_GXM_MULTISAMPLE_NONE)
-        height /= 2;
-    if (cached_info.multisample_mode == SCE_GXM_MULTISAMPLE_4X)
-        width /= 2;
+    // the guest addresses an MSAA depth buffer at its sample rate, which is the size we store, so the request needs no MSAA adjustment; a pixel-rate read is handled as a scaled view below
 
     const bool is_stencil = can_be_stencil;
 
@@ -1939,14 +1939,42 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_depth_stencil_as_tex
     cached_info.texture.transition_to(cmd_buffer, vkutil::ImageLayout::TransferSrc, vkutil::ds_subresource_range);
     vk::ImageSubresourceLayers layers = vkutil::color_subresource_layer;
     layers.aspectMask = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
-    vk::ImageCopy image_copy{
-        .srcSubresource = layers,
-        .srcOffset = { static_cast<int>(delta_col_samples), static_cast<int>(delta_row_samples), 0 },
-        .dstSubresource = layers,
-        .dstOffset = { 0, 0, 0 },
-        .extent = { std::min(width, cached_info.texture.width - delta_col_samples), std::min(height, cached_info.texture.height - delta_row_samples), 1U }
-    };
-    cmd_buffer.copyImage(cached_info.texture.image, vk::ImageLayout::eTransferSrcOptimal, read_only.depth_view.image, vk::ImageLayout::eTransferDstOptimal, image_copy);
+
+    // a same-aspect request for fewer samples at the surface start is a lower-resolution VIEW of the whole surface, and a fullscreen effect samples it with 0..1 UVs, so it must be scaled into and not cropped
+    const uint32_t src_width = cached_info.texture.width - delta_col_samples;
+    const uint32_t src_height = cached_info.texture.height - delta_row_samples;
+    const bool downscaled_view = delta_col_samples == 0 && delta_row_samples == 0
+        && (width < src_width || height < src_height)
+        && static_cast<uint64_t>(src_width) * height == static_cast<uint64_t>(src_height) * width;
+
+    if (downscaled_view) {
+        const std::array<vk::Offset3D, 2> src_bounds{ vk::Offset3D{ 0, 0, 0 }, vk::Offset3D{ static_cast<int32_t>(src_width), static_cast<int32_t>(src_height), 1 } };
+        const std::array<vk::Offset3D, 2> dst_bounds{ vk::Offset3D{ 0, 0, 0 }, vk::Offset3D{ static_cast<int32_t>(width), static_cast<int32_t>(height), 1 } };
+        const auto region_for = [&](vk::ImageAspectFlagBits aspect) {
+            const vk::ImageSubresourceLayers aspect_layers{ aspect, 0, 0, 1 };
+            return vk::ImageBlit{
+                .srcSubresource = aspect_layers,
+                .srcOffsets = src_bounds,
+                .dstSubresource = aspect_layers,
+                .dstOffsets = dst_bounds
+            };
+        };
+        const std::array<vk::ImageBlit, 2> blit_regions{
+            region_for(vk::ImageAspectFlagBits::eDepth),
+            region_for(vk::ImageAspectFlagBits::eStencil)
+        };
+        // a depth/stencil blit must use nearest filtering
+        cmd_buffer.blitImage(cached_info.texture.image, vk::ImageLayout::eTransferSrcOptimal, read_only.depth_view.image, vk::ImageLayout::eTransferDstOptimal, blit_regions, vk::Filter::eNearest);
+    } else {
+        vk::ImageCopy image_copy{
+            .srcSubresource = layers,
+            .srcOffset = { static_cast<int>(delta_col_samples), static_cast<int>(delta_row_samples), 0 },
+            .dstSubresource = layers,
+            .dstOffset = { 0, 0, 0 },
+            .extent = { std::min(width, src_width), std::min(height, src_height), 1U }
+        };
+        cmd_buffer.copyImage(cached_info.texture.image, vk::ImageLayout::eTransferSrcOptimal, read_only.depth_view.image, vk::ImageLayout::eTransferDstOptimal, image_copy);
+    }
 
     // transition back
     cached_info.texture.transition_to(cmd_buffer, vkutil::ImageLayout::DepthStencilReadOnly, vkutil::ds_subresource_range);
@@ -1960,8 +1988,31 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_depth_stencil_as_tex
 }
 
 static Framebuffer empty_framebuffer{};
+// Vulkan gives sRGB formats no storage-image support, and the fragment shader already converts for itself
+static constexpr bool COLOR_STORAGE_VIEW_IS_LINEAR = true;
+
+vk::ImageView VKSurfaceCache::color_storage_view(ColorSurfaceCacheInfo &info) {
+    if (!COLOR_STORAGE_VIEW_IS_LINEAR || info.texture.format != vk::Format::eR8G8B8A8Srgb)
+        return info.texture.view;
+
+    if (!info.linear_storage_view) {
+        // a storage image must use an identity component mapping, which is what the surface view uses too
+        const vk::ImageViewCreateInfo view_info{
+            .image = info.texture.image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = vk::Format::eR8G8B8A8Unorm,
+            .components = vkutil::default_comp_mapping,
+            .subresourceRange = vkutil::color_subresource_range
+        };
+        info.linear_storage_view = state.device.createImageView(view_info);
+    }
+
+    return info.linear_storage_view;
+}
+
 Framebuffer &VKSurfaceCache::retrieve_framebuffer_handle(MemState &mem, SceGxmColorSurface *color, SceGxmDepthStencilSurface *depth_stencil,
-    vk::RenderPass standard_render_pass, vk::RenderPass interlock_render_pass, vk::ImageView &color_view, vk::ImageView &ds_view) {
+    vk::RenderPass standard_render_pass, vk::RenderPass interlock_render_pass, vk::ImageView &color_view, vk::ImageView &ds_view,
+    vk::ImageView &color_storage_view_out) {
     if (!target) {
         LOG_ERROR("Unable to retrieve framebuffer with no active render target!");
         return empty_framebuffer;
@@ -1993,6 +2044,7 @@ Framebuffer &VKSurfaceCache::retrieve_framebuffer_handle(MemState &mem, SceGxmCo
 
     color_view = color_result.view;
     ds_view = ds_result.view;
+    color_storage_view_out = color_result.storage_view ? color_result.storage_view : color_result.view;
 
     std::pair<vk::ImageView, vk::ImageView> key = { color_view, ds_view };
     auto it = framebuffer_array.find(key);

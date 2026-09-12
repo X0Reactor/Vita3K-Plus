@@ -328,6 +328,7 @@ struct VKContext : public renderer::Context {
     vkutil::Image *current_color_base_image;
     vk::Format current_color_format;
     vk::ImageView current_color_view;
+    vk::ImageView current_color_storage_view;
     vk::ImageView current_ds_view;
 
     bool is_recording = false;

@@ -119,6 +119,9 @@ struct ColorSurfaceCacheInfo : public SurfaceCacheInfo {
     // typeless reinterpret compute pass. Only created if that path is taken.
     vk::ImageView reinterpret_store_view = nullptr;
 
+    // a storage image may not be sRGB so the shader-interlock path stores through this linear view instead
+    vk::ImageView linear_storage_view = nullptr;
+
     // only used when upscaling is enabled, to downscale the image first
     std::unique_ptr<vkutil::Image> blit_image;
 
@@ -215,6 +218,7 @@ struct SurfaceRetrieveResult {
     vk::ImageView view;
     vkutil::Image *base_image;
     vkutil::Image *raw_image = nullptr;
+    vk::ImageView storage_view = nullptr;
 };
 
 // for use with the surface_cast_reinterpret shader
@@ -272,6 +276,9 @@ private:
     void destroy_framebuffers(vk::ImageView view);
 
     void destroy_surface(ColorSurfaceCacheInfo &info);
+
+    // lazily makes the linear view a storage image needs when the surface itself is sRGB
+    vk::ImageView color_storage_view(ColorSurfaceCacheInfo &info);
     void destroy_surface(DepthStencilSurfaceCacheInfo &info);
 
     // reload a surface's guest-memory content into its Vulkan image (recorded in prerender_cmd)
@@ -343,7 +350,8 @@ public:
     std::optional<TextureLookupResult> retrieve_depth_stencil_as_texture(const SceGxmTexture &texture, TextureViewport *texture_viewport);
 
     Framebuffer &retrieve_framebuffer_handle(MemState &mem, SceGxmColorSurface *color, SceGxmDepthStencilSurface *depth_stencil,
-        vk::RenderPass standard_render_pass, vk::RenderPass interlock_render_pass, vk::ImageView &color_view, vk::ImageView &ds_view);
+        vk::RenderPass standard_render_pass, vk::RenderPass interlock_render_pass, vk::ImageView &color_view, vk::ImageView &ds_view,
+        vk::ImageView &color_storage_view_out);
 
     // Check if the address is one of a used surface
     // If it is the case, this function returns true, moves the callback
