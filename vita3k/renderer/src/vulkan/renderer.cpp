@@ -2085,7 +2085,7 @@ void VKState::unmap_memory(MemState &mem, Ptr<void> address) {
     // A range that fell back to page-table holds a vkutil::Buffer
     if ((mapping_method == MappingMethod::NativeBuffer || mapping_method == MappingMethod::ExernalHost)
         && std::holds_alternative<vkutil::Buffer>(ite->second.buffer_impl)) {
-        remove_external_mapping(mem, address.cast<uint8_t>().get(mem), ite->second.size);
+        remove_external_mapping(mem, static_cast<uint8_t *>(std::get<vkutil::Buffer>(ite->second.buffer_impl).mapped_data), ite->second.size);
         mapped_memories.erase(ite);
         return;
     }
@@ -2134,7 +2134,7 @@ void VKState::unmap_memory(MemState &mem, Ptr<void> address) {
 #endif
 
     case MappingMethod::PageTable:
-        remove_external_mapping(mem, address.cast<uint8_t>().get(mem), ite->second.size);
+        remove_external_mapping(mem, static_cast<uint8_t *>(std::get<vkutil::Buffer>(ite->second.buffer_impl).mapped_data), ite->second.size);
         break;
 
     default:

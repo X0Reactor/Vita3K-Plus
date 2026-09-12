@@ -137,6 +137,20 @@ void finish(State &state, Context *context) {
     }
 }
 
+// A list abandoned around or after a wait began may carry the signal that the wait is blocked on
+bool signal_may_be_lost(State &state, const int64_t wait_start_epoch_ms) {
+    if (!recover_from_abandoned_lists)
+        return false;
+    // a signal this late is a wedge rather than a slow frame, and an abandon this old can still be ours
+    constexpr int64_t MIN_WAIT_MS = 2000;
+    constexpr int64_t ABANDON_WINDOW_MS = 60000;
+    const int64_t abandoned = state.last_abandon_epoch_ms.load(std::memory_order_relaxed);
+    if (abandoned == 0)
+        return false;
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    return now - wait_start_epoch_ms >= MIN_WAIT_MS && abandoned + ABANDON_WINDOW_MS >= wait_start_epoch_ms;
+}
+
 int wait_for_status(State &state, int *status, int signal, bool wake_on_equal) {
     std::unique_lock<std::mutex> lock(state.command_finish_one_mutex);
     const bool wake_on_unequal = !wake_on_equal;
@@ -146,10 +160,21 @@ int wait_for_status(State &state, int *status, int signal, bool wake_on_equal) {
     }
 
     // unblock threads if shutting down
-    state.command_finish_one.wait(lock, [&]() {
+    const auto ready = [&]() {
         return state.render_abort.load(std::memory_order_relaxed)
             || ((*status == signal) ^ wake_on_unequal);
-    });
+    };
+    const int64_t wait_start_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    while (!state.command_finish_one.wait_for(lock, std::chrono::milliseconds(250), ready)) {
+        if (!signal_may_be_lost(state, wait_start_ms))
+            continue;
+        // the command that would complete this status was abandoned, so a stale status beats never returning
+        static std::atomic<uint32_t> released{ 0 };
+        const uint32_t n = released.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n & 1023) == 0)
+            LOG_ERROR("[CMDLOST] a command list was abandoned while waiting for its completion status; releasing the waiter (#{})", n);
+        break;
+    }
     return *status;
 }
 

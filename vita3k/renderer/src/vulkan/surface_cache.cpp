@@ -32,6 +32,9 @@
 #include <util/log.h>
 #include <util/vector_utils.h>
 
+static constexpr bool sync_fully_rendered_small_linear = true;
+static constexpr uint32_t SMALL_LINEAR_SURFACE_LIMIT = 512;
+
 extern "C" {
 #include <libswscale/swscale.h>
 }
@@ -691,6 +694,7 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
 
     // get the least recently used (probably unused) color surface
     ColorSurfaceCacheInfo &info_added = *color_surface_queue.get_lru();
+
     if (info_added.texture.image) {
         // deferred destruction of the existing surface
         destroy_surface(info_added);
@@ -806,6 +810,10 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
         *info_added.need_surface_sync = color->surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR;
     } else {
         protect_surface(mem, info_added);
+        if (sync_fully_rendered_small_linear && tiling == SurfaceTiling::Linear
+            && original_width <= SMALL_LINEAR_SURFACE_LIMIT && original_height <= SMALL_LINEAR_SURFACE_LIMIT) {
+            *info_added.need_surface_sync = true;
+        }
     }
 
     // it's not impossible that this surface will be rendered once and only used after, so do not skip any shader on it
@@ -864,9 +872,8 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
         }
     }
 
-    if (!found) {
+    if (!found)
         return std::nullopt;
-    }
 
     if (*ite->second->dirty && ite->second->last_frame_rendered + 2 <= reinterpret_cast<VKContext *>(state.context)->frame_timestamp) {
         return std::nullopt;
@@ -2256,8 +2263,16 @@ ColorSurfaceCacheInfo *VKSurfaceCache::perform_surface_sync() {
     if (!state.features.enable_memory_mapping)
         return nullptr;
 
-    if (last_written_surface == nullptr || !*last_written_surface->need_surface_sync)
+    if (last_written_surface && last_written_surface->dirty && *last_written_surface->dirty
+        && last_written_surface->original_width <= SMALL_LINEAR_SURFACE_LIMIT
+        && last_written_surface->original_height <= SMALL_LINEAR_SURFACE_LIMIT) {
+        // The guest wrote into this range after we rendered, so its bytes are newer than our image
         return nullptr;
+    }
+
+    if (last_written_surface == nullptr || !*last_written_surface->need_surface_sync) {
+        return nullptr;
+    }
 
     // repack-format surfaces (CPU-converted writeback) sync at most once per 25ms
     if (surface_sync_needs_f10_repack(*last_written_surface) || surface_sync_needs_se5_repack(*last_written_surface)) {
@@ -2348,6 +2363,17 @@ ColorSurfaceCacheInfo *VKSurfaceCache::perform_surface_sync() {
             rt_clamped = true;
         }
     }
+    if (sync_fully_rendered_small_linear && last_written_surface->tiling == SurfaceTiling::Linear
+        && last_written_surface->original_width <= SMALL_LINEAR_SURFACE_LIMIT
+        && last_written_surface->original_height <= SMALL_LINEAR_SURFACE_LIMIT) {
+        const ColorSurfaceCacheInfo &ws = *last_written_surface;
+        const bool covers_all = ws.written_x0 <= 0 && ws.written_y0 <= 0
+            && ws.written_x1 >= static_cast<int32_t>(ws.original_width)
+            && ws.written_y1 >= static_cast<int32_t>(ws.original_height);
+        if (!covers_all)
+            return nullptr;
+    }
+
     bool skip_writeback = false;
     if (state.surface_sync_clamp_rt && !sync_from_raw && !needs_copy_buffer) {
         const ColorSurfaceCacheInfo &ws = *last_written_surface;

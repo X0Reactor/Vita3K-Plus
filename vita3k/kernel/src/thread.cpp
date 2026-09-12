@@ -506,10 +506,13 @@ void ThreadState::run_loop() {
         ~TokenGuard() { guest_sched_release_for_block(); }
     } token_guard;
 
+    // Restore the previous state on exit so a nested run loop keeps the outer loop's CPU state
+    CPUState *const prev_cpu_state = get_current_cpu_state();
     set_current_cpu_state(cpu.get());
     struct CpuStateGuard {
-        ~CpuStateGuard() { set_current_cpu_state(nullptr); }
-    } cpu_state_guard;
+        CPUState *prev;
+        ~CpuStateGuard() { set_current_cpu_state(prev); }
+    } cpu_state_guard{ prev_cpu_state };
 
     std::unique_lock<std::mutex> lock(mutex);
     ++call_level;
@@ -962,20 +965,43 @@ std::string ThreadState::describe_suspend_state() const {
 }
 
 std::string ThreadState::log_stack_traceback() const {
-    constexpr Address START_OFFSET = 0;
     constexpr Address END_OFFSET = 1024;
     std::string str;
     const Address sp = read_sp(*cpu);
     // A thread whose sp is near null (i.e. never started, or a non-guest/host thread) has no walkable stack
     if (sp < 0x1000)
         return str;
-    for (Address addr = sp - START_OFFSET; addr <= sp + END_OFFSET; addr += 4) {
+
+    uint32_t frames = 0;
+    uint32_t last_printed = 0;
+    for (Address addr = sp; addr <= sp + END_OFFSET && frames < 24; addr += 4) {
         uint32_t value;
         if (!debug_safe_copy_guest(mem, addr, &value, sizeof(value)))
             continue;
-        const auto mod = kernel.find_module_by_addr(value);
-        if (mod)
-            fmt::format_to(std::back_inserter(str), "0x{:X} (module: {})\n", value, mod->module_name);
+        if ((value & 1) == 0)
+            continue; // not a Thumb return address
+        const uint32_t target = value & ~1u;
+        const auto mod = kernel.find_module_by_addr(target);
+        if (!mod)
+            continue;
+        if (target == last_printed)
+            continue; // collapse the repeats a saved register set produces
+        last_printed = target;
+        frames++;
+        fmt::format_to(std::back_inserter(str), "0x{:08X} (module: {}) [sp+0x{:X}]\n",
+            target, mod->module_name, addr - sp);
     }
+    if (frames == 0)
+        fmt::format_to(std::back_inserter(str), "(no Thumb return addresses in the top {} bytes of stack)\n", END_OFFSET);
+
+    // the raw words as well, so a rejected frame can still be recovered by hand
+    fmt::format_to(std::back_inserter(str), "  raw stack @0x{:08X}:", sp);
+    for (int k = 0; k < 32; k++) {
+        uint32_t w;
+        if (!debug_safe_copy_guest(mem, sp + k * 4, &w, sizeof(w)))
+            break;
+        fmt::format_to(std::back_inserter(str), " {:08X}", w);
+    }
+    str += "\n";
     return str;
 }

@@ -29,6 +29,7 @@
 #include <thread>
 #include <util/lock_and_find.h>
 #include <util/log.h>
+#include <vector>
 
 static constexpr bool LOG_SYNC_PRIMITIVES = false;
 
@@ -206,7 +207,10 @@ inline static int handle_timeout(KernelState &kernel, const ThreadStatePtr &thre
             }
         }
     } else {
-        thread->status_cond.wait(primitive_lock, [&] { return thread->status == ThreadStatus::run; });
+        // A waker holding only thread->mutex can miss this condition variable so recheck it on a timer
+        constexpr auto WAKE_RECHECK_MS = std::chrono::milliseconds(20);
+        while (thread->status != ThreadStatus::run)
+            thread->status_cond.wait_for(primitive_lock, WAKE_RECHECK_MS);
     }
 
     return SCE_KERNEL_OK;
@@ -745,7 +749,6 @@ inline static int mutex_lock_impl(KernelState &kernel, MemState &mem, const char
                 mutex->lock_count += lock_count;
                 if (weight == SyncWeight::Light)
                     mutex->workarea.get(mem)->lockCount += lock_count;
-
                 return SCE_KERNEL_OK;
             }
             if (weight == SyncWeight::Light)
@@ -1003,9 +1006,11 @@ SceInt32 rwlock_lock(KernelState &kernel, MemState &mem, const char *export_name
     // if it is a read lock, it is always recursive
     bool is_recursive = !is_write || (rwlock->attr & SCE_KERNEL_MUTEX_ATTR_RECURSIVE);
 
+    const bool anyone_waiting = !rwlock->waiting_threads->empty();
+
     // cases where we don't need to wait :
     if (rwlock->state == RWLockState::Unlocked // the lock is unlocked
-        || (!is_write && rwlock->state == RWLockState::ReadLocked) // we want a read lock when the lock is readlocked
+        || (!is_write && rwlock->state == RWLockState::ReadLocked && !anyone_waiting) // read lock on a read-locked lock, and nothing queued (matches hardware)
         || (is_recursive && rwlock->owners.contains(thread))) { // the thread asking has already locked this lock
 
         auto it = rwlock->owners.find(thread);
@@ -1489,6 +1494,7 @@ int condvar_signal(KernelState &kernel, const char *export_name, SceUID thread_i
         }
         cond_record(condid, thread_id, 2, 1, 0);
     } else {
+        const bool wake_all = (target_type == Condvar::SignalTarget::Type::All);
         uint32_t woken = 0;
         while (!waiting_threads->empty()) {
             const auto waiting_thread_data = *waiting_threads->begin();
@@ -1497,6 +1503,8 @@ int condvar_signal(KernelState &kernel, const char *export_name, SceUID thread_i
             waiting_thread->update_status(ThreadStatus::run, ThreadStatus::wait);
             waiting_threads->pop();
             woken++;
+            if (!wake_all)
+                break;
         }
         cond_record(condid, thread_id, woken ? 2 : 3, woken, 0);
     }
@@ -1750,17 +1758,24 @@ int KernelState::try_break_provable_evf_cycle(bool dry_run) {
 }
 
 void KernelState::log_eventflag_history() {
+    std::vector<std::pair<SceUID, EventFlagPtr>> evsnap;
     {
         const std::lock_guard<std::mutex> lock(mutex);
-        for (const auto &[uid, event] : eventflags) {
-            const std::lock_guard<std::mutex> evlock(event->mutex);
-            if (event->waiting_threads->empty())
-                continue;
-            std::string waiters;
-            for (const auto &w : *event->waiting_threads)
-                waiters += fmt::format(" [tid={} wants=0x{:X} mode=0x{:X}]", w.thread ? w.thread->id : -1, w.flags, w.wait);
-            LOG_ERROR("HANG EVF: flag {} '{}' current=0x{:X} waiters:{}", uid, event->name, event->flags, waiters);
-        }
+        for (const auto &[uid, event] : eventflags)
+            evsnap.emplace_back(uid, event);
+    }
+    for (const auto &[uid, event] : evsnap) {
+        if (!event)
+            continue;
+        std::unique_lock<std::mutex> evlock(event->mutex, std::try_to_lock);
+        if (!evlock.owns_lock())
+            continue;
+        if (event->waiting_threads->empty())
+            continue;
+        std::string waiters;
+        for (const auto &w : *event->waiting_threads)
+            waiters += fmt::format(" [tid={} wants=0x{:X} mode=0x{:X}]", w.thread ? w.thread->id : -1, w.flags, w.wait);
+        LOG_ERROR("HANG EVF: flag {} '{}' current=0x{:X} waiters:{}", uid, event->name, event->flags, waiters);
     }
     const uint64_t next = evf_ring_next.load(std::memory_order_relaxed);
     const uint64_t count = std::min<uint64_t>(next, EVF_RING_SIZE);

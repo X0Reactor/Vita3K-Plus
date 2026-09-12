@@ -1807,6 +1807,12 @@ EXPORT(int, sceGxmBeginCommandList, SceGxmContext *deferredContext) {
         return deferredContext->allocate_new_command(*kernel, *mem, thread_id);
     };
 
+    deferredContext->renderer->describe_command_allocator = [deferredContext]() {
+        return fmt::format("deferred context, commands are host mallocs | vdm range 0x{:08X}..0x{:08X}, {} recorded list range(s)",
+            deferredContext->alloc_space_start.address(), deferredContext->alloc_space_end.address(),
+            deferredContext->command_list_ranges.size());
+    };
+
     deferredContext->renderer->free_func = [](renderer::Command *cmd) {
         // do not delete here, commands will be deleted when they are overwritten
     };
@@ -2162,6 +2168,16 @@ EXPORT(int, sceGxmCreateContext, const SceGxmContextParams *params, Ptr<SceGxmCo
 
     ctx->renderer->free_func = [ctx](renderer::Command *cmd) {
         return ctx->free_new_command(cmd);
+    };
+
+    ctx->renderer->describe_command_allocator = [ctx, mem]() {
+        const renderer::Command *ring = ctx->alloc_space.cast<renderer::Command>().get(*mem);
+        const size_t last_free = ctx->command_last_free_pos.load(std::memory_order_relaxed);
+        const size_t size = ctx->command_allocator_size;
+        return fmt::format("immediate ring {}..{} ({} slots) in guest vdm 0x{:08X} | alloc_pos {} free_pos {} outstanding {}",
+            fmt::ptr(ring), fmt::ptr(ring + size), size, ctx->alloc_space.address(),
+            ctx->command_next_free_pos, last_free,
+            static_cast<int64_t>(ctx->command_next_free_pos) - static_cast<int64_t>(last_free) + static_cast<int64_t>(size) - 1);
     };
 
     emuenv.gxm.immediate_context = context->address();
@@ -3184,7 +3200,20 @@ EXPORT(int, sceGxmNotificationWait, const SceGxmNotification *notification) {
     guest_sched_release_for_block();
     std::unique_lock<std::mutex> lock(emuenv.renderer->notification_mutex);
     if (*value != target_value) {
-        emuenv.renderer->notification_ready.wait(lock, [&]() { return *value == target_value || emuenv.display.abort.load(); });
+        const auto ready = [&]() { return *value == target_value || emuenv.display.abort.load(); };
+        const int64_t wait_start_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        while (!emuenv.renderer->notification_ready.wait_for(lock, std::chrono::milliseconds(250), ready)) {
+            if (!renderer::signal_may_be_lost(*emuenv.renderer, wait_start_ms))
+                continue;
+            // the SignalNotification for this wait died with an abandoned list, so take the work as done
+            *value = target_value;
+            static std::atomic<uint32_t> released{ 0 };
+            const uint32_t n = released.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 8 || (n & 1023) == 0)
+                LOG_ERROR("[GXMLOST] notification at 0x{:08X} was dropped with an abandoned command list; releasing the waiter (#{})",
+                    notification->address.address(), n);
+            break;
+        }
     }
 
     return 0;

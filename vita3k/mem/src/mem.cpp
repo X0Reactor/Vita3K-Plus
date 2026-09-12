@@ -343,17 +343,39 @@ static void release_external_shadow_pages(uint8_t *target, size_t size, size_t h
 #endif
 }
 
+static void apply_host_protect_paged(MemState &state, Address addr, uint32_t size, const MemPerm perm) {
+    if (size == 0)
+        return;
+    if (!state.use_page_table) {
+        apply_host_protect(&state.memory[addr], size, perm, state.host_page_size);
+        return;
+    }
+    const uint64_t end = static_cast<uint64_t>(addr) + size;
+    uint64_t run_start = addr;
+    uint8_t *run_entry = state.page_table[addr / KiB(4)];
+    for (uint64_t page = (static_cast<uint64_t>(addr) & ~static_cast<uint64_t>(0xFFF)) + KiB(4);; page += KiB(4)) {
+        const bool last = page >= end;
+        uint8_t *entry = last ? nullptr : state.page_table[page / KiB(4)];
+        if (last || entry != run_entry) {
+            const uint64_t run_end = last ? end : page;
+            apply_host_protect(run_entry + run_start, static_cast<size_t>(run_end - run_start), perm, state.host_page_size);
+            if (last)
+                break;
+            run_start = page;
+            run_entry = entry;
+        }
+    }
+}
+
 void unprotect_inner(MemState &state, Address addr, uint32_t size) {
     if (LOG_PROTECT) {
         fmt::print("Unprotect: {} {}\n", log_hex(addr), size);
     }
-    uint8_t *addr_ptr = state.use_page_table ? state.page_table[addr / KiB(4)] : state.memory.get();
-    apply_host_protect(&addr_ptr[addr], size, MemPerm::ReadWrite, state.host_page_size);
+    apply_host_protect_paged(state, addr, size, MemPerm::ReadWrite);
 }
 
 void protect_inner(MemState &state, Address addr, uint32_t size, const MemPerm perm) {
-    uint8_t *addr_ptr = state.use_page_table ? state.page_table[addr / KiB(4)] : state.memory.get();
-    apply_host_protect(&addr_ptr[addr], size, perm, state.host_page_size);
+    apply_host_protect_paged(state, addr, size, perm);
 }
 
 std::string (*g_fault_context_provider)() = nullptr;
@@ -629,24 +651,18 @@ bool is_protecting(MemState &state, Address addr, MemPerm *perm) {
 }
 
 // Verify that dst is a faithful copy of src after the bulk memcpy of a page-table transition
-static void verify_and_recopy(MemState &mem, uint8_t *dst, const uint8_t *src, uint32_t size, const char *what, Address addr) {
-    mem.transition_count++;
-    bool recopied_any = false;
-    for (int verify_pass = 0; verify_pass < 4; verify_pass++) {
-        if (memcmp(dst, src, size) == 0)
-            break;
-        int recopied = 0;
-        for (uint32_t off = 0; off < size; off += KiB(4)) {
-            if (memcmp(dst + off, src + off, KiB(4)) != 0) {
-                memcpy(dst + off, src + off, KiB(4));
-                recopied++;
-            }
-        }
-        if (recopied == 0)
-            break;
-        recopied_any = true;
-        LOG_WARN("{} 0x{:X} size 0x{:X}: verify pass {} re-copied {} page(s) changed by a concurrent writer (world not_parked={})", what, addr, size, verify_pass, recopied, mem.transition_not_parked);
+static bool verify_page(MemState &mem, uint8_t *dst, const uint8_t *src, const char *what, Address page_addr) {
+    bool recopied = false;
+    for (int pass = 0; pass < 4 && memcmp(dst, src, KiB(4)) != 0; pass++) {
+        memcpy(dst, src, KiB(4));
+        recopied = true;
+        LOG_WARN("{} page 0x{:X}: verify pass {} re-copied it after a concurrent writer changed it (world not_parked={})", what, page_addr, pass, mem.transition_not_parked);
     }
+    return recopied;
+}
+
+static void note_transition(MemState &mem, bool recopied_any) {
+    mem.transition_count++;
     if (recopied_any) {
         mem.transition_recopy_events++;
         if (mem.transition_not_parked == 0)
@@ -667,8 +683,15 @@ void add_external_mapping(MemState &mem, Address addr, uint32_t size, uint8_t *a
 
     const std::unique_lock<std::shared_mutex> transition_lock(mem.external_transition_mutex);
 
-    memcpy(addr_ptr, original_address, size);
-    verify_and_recopy(mem, addr_ptr, original_address, size, "add_external_mapping", addr);
+    // Copy every page from its live backing
+    bool recopied_any = false;
+    for (uint32_t off = 0; off < size; off += KiB(4)) {
+        const Address page_addr = addr + off;
+        const uint8_t *src = mem.page_table[page_addr / KiB(4)] + page_addr;
+        memcpy(addr_ptr + off, src, KiB(4));
+        recopied_any |= verify_page(mem, addr_ptr + off, src, "add_external_mapping", page_addr);
+    }
+    note_transition(mem, recopied_any);
 
     std::atomic_thread_fence(std::memory_order_release);
     for (uint32_t block = 0; block < size / KiB(4); block++)
@@ -685,6 +708,12 @@ void add_external_mapping(MemState &mem, Address addr, uint32_t size, uint8_t *a
 void remove_external_mapping(MemState &mem, uint8_t *addr_ptr, uint32_t size) {
     uint64_t addr_value = std::bit_cast<uint64_t>(addr_ptr);
     MemExternalMapping mapping;
+    struct Survivor {
+        uint8_t *base;
+        Address address;
+        uint32_t size;
+    };
+    std::vector<Survivor> survivors;
     if (mem.use_page_table) {
         const std::unique_lock<std::mutex> lock(mem.protect_mutex);
         const std::lock_guard<std::mutex> ext_lock(mem.external_mapping_mutex);
@@ -692,11 +721,17 @@ void remove_external_mapping(MemState &mem, uint8_t *addr_ptr, uint32_t size) {
         assert(it != mem.external_mapping.end());
         if (it == mem.external_mapping.end()) {
             LOG_ERROR("[EXTMAP] remove MISS key=0x{:X} size=0x{:X}: entry already gone (was crashing via end() deref); {} live entries:", addr_value, size, mem.external_mapping.size());
+            for (const auto &[host, other] : mem.external_mapping)
+                LOG_ERROR("[EXTMAP]   host 0x{:X} -> guest 0x{:X} size 0x{:X}", host, other.address, other.size);
             return;
         }
 
         mapping = it->second;
         mem.external_mapping.erase(it);
+        for (const auto &[host, other] : mem.external_mapping) {
+            if (other.address < mapping.address + mapping.size && mapping.address < other.address + other.size)
+                survivors.push_back({ std::bit_cast<uint8_t *>(host), other.address, other.size });
+        }
     } else {
         mapping.address = static_cast<Address>(addr_ptr - mem.memory.get());
         mapping.size = size;
@@ -727,15 +762,57 @@ void remove_external_mapping(MemState &mem, uint8_t *addr_ptr, uint32_t size) {
     if (mem.use_page_table) {
         const std::unique_lock<std::shared_mutex> transition_lock(mem.external_transition_mutex);
 
-        uint8_t *arena = &mem.memory[mapping.address];
-        apply_host_protect(arena, mapping.size, MemPerm::ReadWrite, mem.host_page_size);
+        uint8_t *const own_entry = addr_ptr - mapping.address;
+        bool recopied_any = false;
 
-        memcpy(arena, addr_ptr, mapping.size);
-        verify_and_recopy(mem, arena, addr_ptr, mapping.size, "remove_external_mapping", mapping.address);
+        uint32_t run_begin = 0, run_end = 0; // byte offsets of the pending arena run
+        const auto flush_run = [&]() {
+            if (run_end == run_begin)
+                return;
+            uint8_t *arena = &mem.memory[mapping.address + run_begin];
+            apply_host_protect(arena, run_end - run_begin, MemPerm::ReadWrite, mem.host_page_size);
+            for (uint32_t off = run_begin; off < run_end; off += KiB(4)) {
+                memcpy(arena + (off - run_begin), addr_ptr + off, KiB(4));
+                recopied_any |= verify_page(mem, arena + (off - run_begin), addr_ptr + off, "remove_external_mapping", mapping.address + off);
+            }
+            std::atomic_thread_fence(std::memory_order_release);
+            for (uint32_t off = run_begin; off < run_end; off += KiB(4))
+                mem.page_table[(mapping.address + off) / KiB(4)] = mem.memory.get();
+            run_begin = run_end;
+        };
 
-        std::atomic_thread_fence(std::memory_order_release);
-        for (uint32_t block = 0; block < mapping.size / KiB(4); block++)
-            mem.page_table[mapping.address / KiB(4) + block] = mem.memory.get();
+        for (uint32_t off = 0; off < mapping.size; off += KiB(4)) {
+            const Address page_addr = mapping.address + off;
+            const size_t index = page_addr / KiB(4);
+            if (mem.page_table[index] != own_entry) {
+                // lives in the arena already (an old hole) or in a newer mapping: nothing of ours to copy back
+                flush_run();
+                run_begin = run_end = off + KiB(4);
+                continue;
+            }
+            const Survivor *heir = nullptr;
+            for (const Survivor &candidate : survivors) {
+                if (candidate.address <= page_addr && page_addr < candidate.address + candidate.size) {
+                    heir = &candidate;
+                    break;
+                }
+            }
+            if (!heir) {
+                if (run_end != off)
+                    run_begin = run_end = off;
+                run_end = off + KiB(4);
+                continue;
+            }
+            flush_run();
+            run_begin = run_end = off + KiB(4);
+            uint8_t *dst = heir->base + (page_addr - heir->address);
+            memcpy(dst, addr_ptr + off, KiB(4));
+            recopied_any |= verify_page(mem, dst, addr_ptr + off, "remove_external_mapping(hand-over)", page_addr);
+            std::atomic_thread_fence(std::memory_order_release);
+            mem.page_table[index] = heir->base - heir->address;
+        }
+        flush_run();
+        note_transition(mem, recopied_any);
     }
 }
 

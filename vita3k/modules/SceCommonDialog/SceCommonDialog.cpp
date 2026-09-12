@@ -786,6 +786,8 @@ EXPORT(int, sceNpTrophySetupDialogGetResult, Ptr<SceNpTrophySetupDialogResult> r
 EXPORT(int, sceNpTrophySetupDialogGetStatus) {
     TRACY_FUNC(sceNpTrophySetupDialogGetStatus);
     complete_trophy_setup_dialog(emuenv.common_dialog);
+    if (emuenv.common_dialog.type != TROPHY_SETUP_DIALOG)
+        return SCE_COMMON_DIALOG_STATUS_NONE;
     return emuenv.common_dialog.status;
 }
 

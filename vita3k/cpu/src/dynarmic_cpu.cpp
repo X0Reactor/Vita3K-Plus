@@ -33,6 +33,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -400,6 +401,32 @@ public:
         return true;
     }
 
+    // an access straddling a 4 KiB page boundary resolves each half through the page table
+    template <typename T>
+    static bool straddles_page(Dynarmic::A32::VAddr addr) {
+        return ((addr & 0xFFFu) + sizeof(T)) > 0x1000u;
+    }
+
+    template <typename T>
+    T read_straddling(Dynarmic::A32::VAddr addr) {
+        MemState &mem = *parent->mem;
+        const uint32_t first = 0x1000u - (addr & 0xFFFu);
+        T value;
+        uint8_t *out = reinterpret_cast<uint8_t *>(&value);
+        memcpy(out, Ptr<uint8_t>(addr).get(mem), first);
+        memcpy(out + first, Ptr<uint8_t>(static_cast<Address>(addr + first)).get(mem), sizeof(T) - first);
+        return value;
+    }
+
+    template <typename T>
+    void write_straddling(Dynarmic::A32::VAddr addr, T value) {
+        MemState &mem = *parent->mem;
+        const uint32_t first = 0x1000u - (addr & 0xFFFu);
+        const uint8_t *in = reinterpret_cast<const uint8_t *>(&value);
+        memcpy(Ptr<uint8_t>(addr).get(mem), in, first);
+        memcpy(Ptr<uint8_t>(static_cast<Address>(addr + first)).get(mem), in + first, sizeof(T) - first);
+    }
+
     template <typename T>
     T MemoryRead(Dynarmic::A32::VAddr addr) {
         Ptr<T> ptr{ addr };
@@ -416,6 +443,12 @@ public:
                     LOG_ERROR("Executing: {}", disassemble(*parent, pc, nullptr));
             }
             return 0;
+        }
+
+        if constexpr (sizeof(T) > 1) {
+            if (straddles_page<T>(addr) && Ptr<uint8_t>(static_cast<Address>(addr + sizeof(T) - 1)).valid(*parent->mem)) {
+                return read_straddling<T>(addr);
+            }
         }
 
         T ret = *ptr.get(*parent->mem);
@@ -459,6 +492,13 @@ public:
                     LOG_ERROR("Executing: {}", disassemble(*parent, pc, nullptr));
             }
             return;
+        }
+
+        if constexpr (sizeof(T) > 1) {
+            if (straddles_page<T>(addr) && Ptr<uint8_t>(static_cast<Address>(addr + sizeof(T) - 1)).valid(*parent->mem)) {
+                write_straddling<T>(addr, value);
+                return;
+            }
         }
 
         *ptr.get(*parent->mem) = value;
@@ -606,6 +646,9 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
     if (parent->mem->use_page_table) {
         config.page_table = (log_mem || !cpu_opt) ? nullptr : reinterpret_cast<decltype(config.page_table)>(parent->mem->page_table.get());
         config.absolute_offset_page_table = true;
+        // the fast path reads through the first page only (so the page straddling accesses must use the callbacks)
+        config.detect_misaligned_access_via_page_table = 16 | 32 | 64;
+        config.only_detect_misalignment_via_page_table_on_page_boundary = true;
     } else if (!log_mem && cpu_opt) {
         config.fastmem_pointer = std::bit_cast<uintptr_t>(parent->mem->memory.get());
     }

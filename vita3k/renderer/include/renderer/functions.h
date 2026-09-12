@@ -67,6 +67,9 @@ SyncWaitResult wishlist(SceGxmSyncObject *sync_object, const uint32_t timestamp,
  */
 void subject_done(SceGxmSyncObject *sync_object, const uint32_t timestamp);
 
+inline constexpr bool recover_from_abandoned_lists = true;
+bool signal_may_be_lost(State &state, int64_t wait_start_epoch_ms);
+
 int wait_for_status(State &state, int *status, int signal, bool wake_on_equal);
 void reset_command_list(CommandList &command_list);
 void submit_command_list(State &state, renderer::Context *context, CommandList &command_list);

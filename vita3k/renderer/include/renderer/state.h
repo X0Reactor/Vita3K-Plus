@@ -123,6 +123,7 @@ struct State {
     std::atomic<int64_t> last_mem_transition_epoch_ms{ 0 };
     std::atomic<int> last_cmd_opcode{ -1 };
     std::atomic<int64_t> last_cmd_epoch_ms{ 0 };
+    std::atomic<int64_t> last_abandon_epoch_ms{ 0 };
     std::atomic<bool> in_dormant_wait{ false };
     std::atomic<int> wait_last_kind{ -1 };
     std::atomic<int64_t> wait_last_epoch_ms{ 0 };
