@@ -40,6 +40,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <vector>
 
 struct ThreadState;
@@ -141,6 +142,10 @@ struct KernelState {
     SceKernelModuleInfoPtrs loaded_modules;
     LoadedSysmodules loaded_sysmodules;
     LoadedInternalSysmodules loaded_internal_sysmodules;
+
+    // a game can spawn a thread per async read, so an identical creation is only worth one INFO line
+    std::mutex logged_threads_mutex;
+    std::set<std::string> logged_threads;
 
     // the variables in this block must be accessed by first locking export_nids_mutex
     std::mutex export_nids_mutex;

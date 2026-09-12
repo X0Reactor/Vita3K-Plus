@@ -90,6 +90,9 @@ bool ThreadState::wait_for_run_precise(std::unique_lock<std::mutex> &lock, int64
     return status_cond.wait_until(lock, deadline, woken);
 }
 
+// LOG_DEBUG is compiled out, so set this true to get every thread creation back rather than one per shape
+static constexpr bool LOG_EVERY_THREAD_CREATION = false;
+
 int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option = nullptr) {
     constexpr size_t KERNEL_TLS_SIZE = 0x800;
 
@@ -132,7 +135,18 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
     stack = alloc_block(mem, stack_size, alloc_name.c_str());
     memset(stack.get_ptr<void>().get(mem), 0xcc, stack_size);
 
-    LOG_INFO("[THREAD] created \"{}\" (#{}) entry=0x{:X} prio={} affinity=0x{:X} stack=0x{:X}..0x{:X}", name, id, entry_point.address(), priority, affinity_mask, stack.get(), stack.get() + stack_size);
+    const std::string thread_line = fmt::format("[THREAD] created \"{}\" (#{}) entry=0x{:X} prio={} affinity=0x{:X} stack=0x{:X}..0x{:X}", name, id, entry_point.address(), priority, affinity_mask, stack.get(), stack.get() + stack_size);
+    bool first_of_shape;
+    {
+        const std::lock_guard<std::mutex> guard(kernel.logged_threads_mutex);
+        first_of_shape = kernel.logged_threads.emplace(fmt::format("{}|{:X}|{}|{:X}", name, entry_point.address(), priority, affinity_mask)).second;
+    }
+
+    // a repeat of an identical shape carries nothing new so only the first one is INFO
+    if (LOG_EVERY_THREAD_CREATION || first_of_shape)
+        LOG_INFO("{}", thread_line);
+    else
+        LOG_DEBUG("{}", thread_line);
 
     alloc_name = fmt::format("TLS for thread {} (#{})", name, id);
     const size_t tls_size = KERNEL_TLS_SIZE + kernel.tls_msize;
