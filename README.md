@@ -12,15 +12,16 @@ https://github.com/nckstwrt/Vita3K-Plus/releases
 
 > **Mali Users:** There are things that will definitely not work and most likely never work with Mali. Very little I can (or want) to do about that I'm afraid.
 
-> **Freezing or hangs:** Enable **Accurate Thread Scheduling** in Graphics settings.  
+> **Freezing or hangs:** Enable **Accurate Thread Scheduling** in Graphics settings (which is the new default).  
 > This is needed for games such as *Dead or Alive 5 Plus*, *Sonic*, *Samurai Warriors 3*, etc.
+> Sonic can be temperamental but should start ok 80% of the time
 
 ## Enhancements
 
-# v1.1 (Not Yet Released)
+# v1.1 - Released 13th Sept 2026
 - **Dead Or Alive 5 Plus** - Working - On Android requires Adreno, Turnip and the new setting Thread Scheduling Accuracy On
 - **Metal Gear Solid 3** - Freezes fixed/worked around. Blending graphics fixed. On-Screen Touchpad fixes.
-- **Resistance** - Rendering issues fixed on Android
+- **Resistance** - Rendering issues fixed on Android (for Turnip devices - Mali can still have issues)
 - **Assassin's Creed III: Liberation**: Sound issues resolved
 - **Killzone** - Fix for the crash occurring at level 5
 - **Neptunia Re;Birth1** - Fix for crash after selecting New Game and background images not showing
@@ -45,9 +46,9 @@ https://github.com/nckstwrt/Vita3K-Plus/releases
 - **Evil Corps From Hell** - Loading and graphics fixed
 - **Tearaway** - Graphics Fixed
 - **Ultimate Marvel vs Capcom 3** - Graphics Fixed
-- 
-- Defaults now to External Host for Windows and Native Buffer (will auto default to Page Table if unavailable) on Android. **Use these Memory Mapping options for the best compatibility**
-- Lots of memory, timing, IME and sound improvements
+<!-- -->
+- Defaults now to External Host for Windows and Page Table on Android. **Use these Memory Mapping options for the best compatibility**
+- Lots of memory, timing, stability, IME and sound improvements
 - Thanks to Reyes for all his help testing!
 
 # v1.0
