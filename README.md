@@ -8,10 +8,13 @@ https://github.com/nckstwrt/Vita3K-Plus/releases
 
 ## Android notes
 
+> [!IMPORTANT]
 > **Snapdragon / Adreno:** Use Turnip drivers for the best compatibility.
 
+> [!IMPORTANT]
 > **Mali Users:** There are things that will definitely not work and most likely never work with Mali. Very little I can (or want) to do about that I'm afraid.
 
+> [!IMPORTANT]
 > **Freezing or hangs:** Enable **Accurate Thread Scheduling** in Graphics settings (which is the new default).  
 > This is needed for games such as *Dead or Alive 5 Plus*, *Sonic*, *Samurai Warriors 3*, etc.
 > Sonic can be temperamental but should start ok 80% of the time
