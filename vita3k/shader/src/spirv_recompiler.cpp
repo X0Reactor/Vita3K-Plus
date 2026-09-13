@@ -1226,7 +1226,7 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
 
     if (program_type == SceGxmProgramType::Vertex) {
         // Create the default reg uniform buffer
-        std::vector<spv::Id> uniform_composition = { v4, f32, f32, f32, f32, f32 };
+        std::vector<spv::Id> uniform_composition = { v4, f32, f32, f32, f32, f32, f32 };
         if (uniform_buffer_count > 0)
             uniform_composition.push_back(buffer_addresses_type);
         if (uniform_texture_count > 0) {
@@ -1250,6 +1250,7 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
         ADD_VERT_UNIFORM_MEMBER(screen_height);
         ADD_VERT_UNIFORM_MEMBER(z_offset);
         ADD_VERT_UNIFORM_MEMBER(z_scale);
+        ADD_VERT_UNIFORM_MEMBER(far_clip);
 
 #undef ADD_VERT_UNIFORM_MEMBER
 #define ADD_EXT_UNIFORM_MEMBER(name)                                                                                                                                                \
@@ -1923,16 +1924,16 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
     o_op.num = 0;
     o_op.swizzle = SWIZZLE_CHANNEL_4_DEFAULT;
 
-    // gl_ClipDistance carries the two eye-plane guards first, then the planes the program declares
+    // gl_ClipDistance carries the three eye and far plane guards first, then the planes the program declares
     const bool emit_eye_clip = translation_state.is_vulkan && features.support_clip_distance && (vertex_outputs & SCE_GXM_VERTEX_PROGRAM_OUTPUT_POSITION);
-    const uint32_t eye_clip_count = emit_eye_clip ? 2 : 0;
+    const uint32_t eye_clip_count = emit_eye_clip ? 3 : 0;
     uint32_t gxm_clip_count = 0;
     if (translation_state.is_vulkan && features.support_gxm_clip_planes) {
         for (uint32_t i = 0; i < 8; i++) {
             if (vertex_outputs & (SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP0 << i))
                 gxm_clip_count++;
         }
-        // Vulkan only guarantees eight clip distances and the eye-plane guards already claim two
+        // Vulkan only guarantees eight clip distances and the guards already claim three
         if (eye_clip_count + gxm_clip_count > 8) {
             LOG_WARN("Vertex program declares {} clip planes, only {} can be translated", gxm_clip_count, 8 - eye_clip_count);
             gxm_clip_count = 8 - eye_clip_count;
@@ -2088,6 +2089,7 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
                 // depth clamp disables z-clipping, so clip eye-plane-crossing primitives ourselves:
                 // [0] w <= 0 is behind the eye; [1] z/w < -1 kills the near-infinity wedge that
                 // survives an exact w=0 clip (clamped-z geometry like KZ sits at z/w ~ -0.001)
+                // [2] z/w beyond the far plane (only for draws whose depth test would fail on real hardware)
                 if (emit_eye_clip) {
                     const spv::Id clip_z_ref = utils::create_access_chain(b, spv::StorageClassOutput, out_var, { b.makeIntConstant(2) });
                     const spv::Id clip_w_ref = utils::create_access_chain(b, spv::StorageClassOutput, out_var, { b.makeIntConstant(3) });
@@ -2097,6 +2099,19 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
                     const spv::Id clip_dist1_ref = utils::create_access_chain(b, spv::StorageClassOutput, clip_var, { b.makeIntConstant(1) });
                     b.createStore(clip_w, clip_dist0_ref);
                     b.createStore(b.createBinOp(spv::OpFAdd, f32, clip_z, clip_w), clip_dist1_ref);
+
+                    // host float rounding can push geometry placed exactly on the far plane a ULP or two past it
+                    constexpr float far_plane_tolerance = 1e-5f;
+                    const spv::Id clip_dist2_ref = utils::create_access_chain(b, spv::StorageClassOutput, clip_var, { b.makeIntConstant(2) });
+                    spv::Id far_distance = b.makeFloatConstant(1.0f);
+                    if (translation_state.render_info_id != spv::NoResult) {
+                        const spv::Id far_clip_ref = utils::create_access_chain(b, spv::StorageClassUniform, translation_state.render_info_id, { b.makeIntConstant(VERT_UNIFORM_far_clip) });
+                        const spv::Id far_clip = b.createLoad(far_clip_ref, spv::NoPrecision);
+                        const spv::Id tolerant_w = b.createBinOp(spv::OpFMul, f32, clip_w, b.makeFloatConstant(1.0f + far_plane_tolerance));
+                        const spv::Id beyond_far = b.createBinOp(spv::OpFSub, f32, tolerant_w, clip_z);
+                        far_distance = b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450FMix, { far_distance, beyond_far, far_clip });
+                    }
+                    b.createStore(far_distance, clip_dist2_ref);
                 }
             } else if (vo == SCE_GXM_VERTEX_PROGRAM_OUTPUT_PSIZE) {
                 b.addDecoration(out_var, spv::DecorationBuiltIn, spv::BuiltInPointSize);

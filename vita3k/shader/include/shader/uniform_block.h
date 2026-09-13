@@ -16,6 +16,7 @@ struct RenderVertUniformBlock {
     float screen_height;
     float z_offset;
     float z_scale;
+    float far_clip = 0.0f;
 };
 
 // used internally to identify the field by the shader recompiler
@@ -26,7 +27,8 @@ enum VertUniformFieldId : uint32_t {
     VERT_UNIFORM_screen_width,
     VERT_UNIFORM_screen_height,
     VERT_UNIFORM_z_offset,
-    VERT_UNIFORM_z_scale
+    VERT_UNIFORM_z_scale,
+    VERT_UNIFORM_far_clip
 };
 
 struct RenderFragUniformBlock {

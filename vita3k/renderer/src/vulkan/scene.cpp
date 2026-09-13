@@ -33,6 +33,22 @@
 
 namespace renderer::vulkan {
 
+// on a PS Vita a fragment beyond the far plane fails a less, equal or never depth test, where Vulkan depth clamp would let it tie
+static constexpr bool drop_fragments_beyond_far_plane = true;
+
+static bool draw_drops_fragments_beyond_far_plane(const GxmRecordState &record) {
+    const auto depth_test_fails = [](SceGxmDepthFunc func) {
+        return func == SCE_GXM_DEPTH_FUNC_NEVER || func == SCE_GXM_DEPTH_FUNC_LESS || func == SCE_GXM_DEPTH_FUNC_EQUAL || func == SCE_GXM_DEPTH_FUNC_LESS_EQUAL;
+    };
+    const auto stencil_quiet = [](const GxmStencilStateOp &op) {
+        return (op.func == SCE_GXM_STENCIL_FUNC_ALWAYS || op.stencil_fail == SCE_GXM_STENCIL_OP_KEEP) && op.depth_fail == SCE_GXM_STENCIL_OP_KEEP;
+    };
+    const bool two_sided = record.two_sided != SCE_GXM_TWO_SIDED_DISABLED;
+    const bool front_drops = depth_test_fails(record.front_depth_func) && stencil_quiet(record.front_stencil_state_op);
+    const bool back_drops = !two_sided || (depth_test_fails(record.back_depth_func) && stencil_quiet(record.back_stencil_state_op));
+    return drop_fragments_beyond_far_plane && front_drops && back_drops;
+}
+
 void set_uniform_buffer(VKContext &context, MemState &mem, const ShaderProgram *program, const bool vertex_shader, const int block_num, const int size, Ptr<uint8_t> data) {
     auto offset = program->uniform_buffer_data_offsets.at(block_num);
     if (offset == static_cast<std::uint32_t>(-1)) {
@@ -525,6 +541,7 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
     vert_ublock.viewport_flag = (context.record.viewport_flat) ? 0.0f : 1.0f;
     vert_ublock.z_offset = context.record.z_offset;
     vert_ublock.z_scale = context.record.z_scale;
+    vert_ublock.far_clip = draw_drops_fragments_beyond_far_plane(context.record) ? 1.0f : 0.0f;
     vert_ublock.screen_width = context.render_target->width / context.state.res_multiplier;
     vert_ublock.screen_height = context.render_target->height / context.state.res_multiplier;
 
