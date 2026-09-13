@@ -93,6 +93,8 @@ std::atomic<uint64_t> evf_ring_next{ 0 };
 // every thread that EVER set each flag: the provable-cycle breaker needs "who could wake this"
 std::mutex evf_setters_mutex;
 std::unordered_map<SceUID, std::set<SceUID>> evf_setters;
+std::mutex evf_dead_since_mutex;
+std::unordered_map<SceUID, uint64_t> evf_dead_since;
 
 void evf_record(SceUID evf, SceUID thread, uint8_t op, uint32_t bits, uint32_t flags_after, uint32_t woken) {
     if (op == 0 && thread > 0) {
@@ -1766,8 +1768,6 @@ int KernelState::try_break_provable_evf_cycle(bool dry_run) {
     }
 
     constexpr uint64_t PROVABLE_DEAD_STABLE_MS = 3000;
-    static std::mutex dead_since_mutex;
-    static std::unordered_map<SceUID, uint64_t> dead_since;
     const uint64_t now_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 
     int broken = 0;
@@ -1789,8 +1789,8 @@ int KernelState::try_break_provable_evf_cycle(bool dry_run) {
         dead_now.insert(uid);
         uint64_t dead_for_ms = 0;
         {
-            const std::lock_guard<std::mutex> lock(dead_since_mutex);
-            dead_for_ms = now_ms - dead_since.try_emplace(uid, now_ms).first->second;
+            const std::lock_guard<std::mutex> lock(evf_dead_since_mutex);
+            dead_for_ms = now_ms - evf_dead_since.try_emplace(uid, now_ms).first->second;
         }
         const bool stable = dead_for_ms >= PROVABLE_DEAD_STABLE_MS;
         LOG_WARN("[EVFCYCLE]{} flag {} '{}' looks PROVABLY dead for {} ms: every historical setter is itself blocked on a flag with waiters - {} bits 0x{:X}",
@@ -1802,10 +1802,19 @@ int KernelState::try_break_provable_evf_cycle(bool dry_run) {
         broken++;
     }
     {
-        const std::lock_guard<std::mutex> lock(dead_since_mutex);
-        std::erase_if(dead_since, [&dead_now](const auto &entry) { return !dead_now.count(entry.first); });
+        const std::lock_guard<std::mutex> lock(evf_dead_since_mutex);
+        std::erase_if(evf_dead_since, [&dead_now](const auto &entry) { return !dead_now.count(entry.first); });
     }
     return broken;
+}
+
+void KernelState::clear_evf_cycle_history() {
+    {
+        const std::lock_guard<std::mutex> lock(evf_setters_mutex);
+        evf_setters.clear();
+    }
+    const std::lock_guard<std::mutex> lock(evf_dead_since_mutex);
+    evf_dead_since.clear();
 }
 
 void KernelState::log_eventflag_history() {

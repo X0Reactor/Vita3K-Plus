@@ -110,7 +110,7 @@ struct KernelState {
     std::mutex mutex;
     CodecEngineBlocks codec_blocks;
 
-    bool accurate_thread_scheduling = false;
+    bool accurate_thread_scheduling = true;
     bool preempt_on_wake = false;
     int preempt_on_wake_us = 1000;
 
@@ -204,6 +204,7 @@ struct KernelState {
     void log_eventflag_history();
     void log_condvar_history();
     int try_break_provable_evf_cycle(bool dry_run = false);
+    void clear_evf_cycle_history();
     std::atomic<int64_t> last_world_stop_epoch_ms{ 0 };
     // Last resort recovery for a full deadlock (called by the hang watchdog)
     int try_break_frame_sync_deadlock(std::vector<SceUID> &already_nudged);

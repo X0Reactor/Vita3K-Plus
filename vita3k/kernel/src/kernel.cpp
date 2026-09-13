@@ -472,6 +472,7 @@ void KernelState::deinit(MemState &mem) {
     lwmutexes.clear();
     rwlocks.clear();
     eventflags.clear();
+    clear_evf_cycle_history();
     msgpipes.clear();
     callbacks.clear();
 

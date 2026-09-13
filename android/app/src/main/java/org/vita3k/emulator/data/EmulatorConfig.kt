@@ -23,7 +23,7 @@ class EmulatorConfig {
     @JvmField var vSync: Boolean = true
     @JvmField var anisotropicFiltering: Int = 1
     @JvmField var asyncPipelineCompilation: Boolean = false
-    @JvmField var accurateThreadScheduling: Boolean = false
+    @JvmField var accurateThreadScheduling: Boolean = true
     @JvmField var exportTextures: Boolean = false
     @JvmField var importTextures: Boolean = false
     @JvmField var exportAsPng: Boolean = true

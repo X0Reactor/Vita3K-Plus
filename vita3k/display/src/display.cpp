@@ -179,6 +179,9 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
             static uint64_t last_dumped_setframe = ~0ull;
             static uint64_t last_break_vblanks = 0;
             static uint64_t last_provable_break_setframe = ~0ull;
+            static uint64_t last_provable_break_vblank = 0;
+            static bool provable_handed_over = false;
+            static uint64_t flip_streak_start_vblank = ~0ull;
             static uint64_t last_provable_dryrun_setframe = ~0ull;
             static uint64_t last_progress_value = 0;
             static uint64_t last_progress_change_vblank = 0;
@@ -210,6 +213,9 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                 last_dumped_setframe = ~0ull;
                 last_break_vblanks = 0;
                 last_provable_break_setframe = ~0ull;
+                last_provable_break_vblank = 0;
+                provable_handed_over = false;
+                flip_streak_start_vblank = ~0ull;
                 last_provable_dryrun_setframe = ~0ull;
                 last_progress_value = 0;
                 last_progress_change_vblank = 0;
@@ -316,11 +322,22 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
             // Cycle breaker
             constexpr uint64_t PROVABLE_DRYRUN_VBLANKS = 120;
             constexpr uint64_t PROVABLE_BREAK_VBLANKS = 300;
+            constexpr uint64_t PROVABLE_RECOVERY_VBLANKS = 600;
+            constexpr uint64_t FLIP_STREAK_MAX_GAP_VBLANKS = 30;
             const int64_t now_epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
             const bool world_stop_quiet = (now_epoch_ms - emuenv.kernel.last_world_stop_epoch_ms.load(std::memory_order_relaxed)) >= 5000;
             // deferred-unmap collapses remaps WITHOUT world-stops, blinding the veto above; transitions are stamped regardless
             const bool mem_transition_quiet = !emuenv.renderer
                 || (now_epoch_ms - emuenv.renderer->last_mem_transition_epoch_ms.load(std::memory_order_relaxed)) >= 5000;
+            // ten seconds of steady frames ends a wedge the cycle breaker handed to the stall breaker
+            if (stall_vblanks > FLIP_STREAK_MAX_GAP_VBLANKS)
+                flip_streak_start_vblank = ~0ull;
+            else if (flip_streak_start_vblank == ~0ull)
+                flip_streak_start_vblank = vblanks;
+            if (provable_handed_over && flip_streak_start_vblank != ~0ull && vblanks - flip_streak_start_vblank >= PROVABLE_RECOVERY_VBLANKS) {
+                provable_handed_over = false;
+                LOG_INFO("HANG WATCHDOG: frames flowed for {} vblanks, provable-cycle breaker re-armed", vblanks - flip_streak_start_vblank);
+            }
             if (!never_flipped && stall_vblanks > PROVABLE_DRYRUN_VBLANKS && unpaused && renderer_idle_vblanks > PROVABLE_DRYRUN_VBLANKS && last_provable_dryrun_setframe != setframe) {
                 last_provable_dryrun_setframe = setframe;
                 emuenv.kernel.try_break_provable_evf_cycle(true);
@@ -330,10 +347,18 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                 // if (!IsDebuggerPresent())  // Debug speed can make a normal load look exactly like a wedge hang
 #endif
                 {
-                    const int broken = emuenv.kernel.try_break_provable_evf_cycle();
-                    if (broken > 0) {
-                        last_provable_break_setframe = setframe;
-                        LOG_ERROR("HANG WATCHDOG: provable-cycle breaker released {} dead event flag(s) after {} vblanks", broken, stall_vblanks);
+                    // a game that wedges again within 10s of a release was not recovered and each frame it draws restarts the stall breaker's 15 s clock
+                    if (!provable_handed_over && last_provable_break_vblank != 0 && setframe >= last_provable_break_vblank && setframe - last_provable_break_vblank < PROVABLE_RECOVERY_VBLANKS) {
+                        provable_handed_over = true;
+                        LOG_ERROR("HANG WATCHDOG: the game wedged again {} vblanks after the last provable-cycle release, leaving this wedge to the stall breaker", setframe - last_provable_break_vblank);
+                    }
+                    if (!provable_handed_over) {
+                        const int broken = emuenv.kernel.try_break_provable_evf_cycle();
+                        if (broken > 0) {
+                            last_provable_break_setframe = setframe;
+                            last_provable_break_vblank = vblanks;
+                            LOG_ERROR("HANG WATCHDOG: provable-cycle breaker released {} dead event flag(s) after {} vblanks", broken, stall_vblanks);
+                        }
                     }
                 }
             }
