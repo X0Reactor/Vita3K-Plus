@@ -1619,11 +1619,15 @@ static void note_page_table_skew(Address address, uint32_t size, uint32_t skew) 
         LOG_INFO_ONCE("[PTSKEW] mapping 0x{:08X} size 0x{:X}: CPU pointer rounded up by 0x{:X} inside its vk::Buffer; get_matching_mapping compensates", address, size, skew);
 }
 
+// Page Table mappings that shared one device memory block lost their data on Turnip (Adreno 840) so each mapping gets its own
+static constexpr bool page_table_dedicated_device_memory = true;
+static constexpr vma::AllocationCreateFlags page_table_dedicated_flag = page_table_dedicated_device_memory ? vma::AllocationCreateFlags(vma::AllocationCreateFlagBits::eDedicatedMemory) : vma::AllocationCreateFlags();
+
 bool VKState::map_memory_page_table_fallback(MemState &mem, Ptr<void> address, uint32_t size) {
     constexpr vk::BufferUsageFlags mapped_memory_flags = vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress | vk::BufferUsageFlagBits::eTransferDst;
     vkutil::Buffer buffer(size + KiB(4));
     constexpr vma::AllocationCreateInfo memory_mapped_alloc = {
-        .flags = vma::AllocationCreateFlagBits::eMapped | vma::AllocationCreateFlagBits::eHostAccessRandom,
+        .flags = vma::AllocationCreateFlagBits::eMapped | vma::AllocationCreateFlagBits::eHostAccessRandom | page_table_dedicated_flag,
         .usage = vma::MemoryUsage::eAutoPreferHost,
         .requiredFlags = vk::MemoryPropertyFlagBits::eHostCoherent,
         .preferredFlags = vk::MemoryPropertyFlagBits::eHostCached,
@@ -1859,7 +1863,7 @@ bool VKState::map_memory(MemState &mem, Ptr<void> address, uint32_t size) {
         vkutil::Buffer buffer(size + KiB(4));
         // HostCached is required, not preferred
         constexpr vma::AllocationCreateInfo memory_mapped_alloc = {
-            .flags = vma::AllocationCreateFlagBits::eMapped | vma::AllocationCreateFlagBits::eHostAccessRandom,
+            .flags = vma::AllocationCreateFlagBits::eMapped | vma::AllocationCreateFlagBits::eHostAccessRandom | page_table_dedicated_flag,
             .usage = vma::MemoryUsage::eAutoPreferHost,
             .requiredFlags = vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
         };
